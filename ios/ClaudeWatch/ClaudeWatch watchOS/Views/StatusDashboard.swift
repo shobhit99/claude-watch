@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Read-only status dashboard showing task summary, files changed, time elapsed, and connection quality.
 struct StatusDashboard: View {
-    @EnvironmentObject private var session: WatchSessionManager
+    @EnvironmentObject private var session: WatchViewState
 
     var body: some View {
         ScrollView {
@@ -163,5 +163,5 @@ struct StatusDashboard: View {
     NavigationStack {
         StatusDashboard()
     }
-    .environmentObject(WatchSessionManager.shared)
+    .environmentObject(WatchViewState.shared)
 }

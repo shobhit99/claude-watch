@@ -1,0 +1,58 @@
+name: ClaudeWatch
+options:
+  bundleIdPrefix: com.shobhit.claudewatch
+  deploymentTarget:
+    iOS: "17.0"
+    watchOS: "10.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+
+targets:
+  ClaudeWatch:
+    type: application
+    platform: iOS
+    sources:
+      - path: "ClaudeWatch iOS"
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch
+        INFOPLIST_FILE: "ClaudeWatch iOS/Info.plist"
+        PRODUCT_NAME: Claude Watch
+        GENERATE_INFOPLIST_FILE: false
+    dependencies:
+      - target: ClaudeWatchWatch
+        embed: true
+
+  ClaudeWatchWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - path: "ClaudeWatch watchOS"
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch.watchkitapp
+        INFOPLIST_FILE: "ClaudeWatch watchOS/Info.plist"
+        PRODUCT_NAME: Claude Watch
+        GENERATE_INFOPLIST_FILE: false
+        SUPPORTS_MACCATALYST: false
+
+schemes:
+  ClaudeWatch:
+    build:
+      targets:
+        ClaudeWatch: all
+        ClaudeWatchWatch: all
+    run:
+      config: Debug
+  ClaudeWatchWatch:
+    build:
+      targets:
+        ClaudeWatchWatch: all
+    run:
+      config: Debug
+      executable: ClaudeWatchWatch

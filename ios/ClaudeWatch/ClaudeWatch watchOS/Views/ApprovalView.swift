@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Decision mode: presented as a sheet so the terminal remains visible underneath.
 struct ApprovalView: View {
-    @EnvironmentObject private var session: WatchSessionManager
+    @EnvironmentObject private var session: WatchViewState
     @Environment(\.dismiss) private var dismiss
 
     let request: ApprovalRequest
@@ -145,5 +145,5 @@ struct ApprovalView: View {
             actionSummary: "Run: rm -rf node_modules && npm install"
         )
     )
-    .environmentObject(WatchSessionManager.shared)
+    .environmentObject(WatchViewState.shared)
 }

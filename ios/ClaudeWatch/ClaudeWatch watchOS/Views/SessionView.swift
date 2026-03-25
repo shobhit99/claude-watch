@@ -4,7 +4,7 @@ import SwiftUI
 
 /// The main screen: shows terminal output and captures commands.
 struct SessionView: View {
-    @EnvironmentObject private var session: WatchSessionManager
+    @EnvironmentObject private var session: WatchViewState
 
     @State private var showVoiceInput = false
     @State private var showTextInput = false
@@ -408,5 +408,5 @@ struct PulseModifier: ViewModifier {
 
 #Preview {
     SessionView()
-        .environmentObject(WatchSessionManager.shared)
+        .environmentObject(WatchViewState.shared)
 }

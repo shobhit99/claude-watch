@@ -25,6 +25,17 @@ final class RelayService: ObservableObject {
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var lastConnected: Date?
 
+    // Permission prompt state
+    @Published var pendingPermission: PendingPermission? = nil
+
+    struct PendingPermission: Identifiable {
+        let id: String // permissionId from bridge
+        let toolName: String
+        let description: String
+        let filePath: String?
+        let timestamp: Date = Date()
+    }
+
     // MARK: - Private
 
     private let bridgeClient = BridgeClient()
@@ -58,22 +69,42 @@ final class RelayService: ObservableObject {
 
     /// Discovers the bridge on LAN and pairs with the given code.
     func pair(code: String) async throws {
-        // Discover bridge via Bonjour
-        let service = try await discovery.discover()
+        print("[RelayService] Starting pair with code: \(code)")
+
+        // Discover bridge via Bonjour (or localhost fallback)
+        let service: BonjourDiscovery.DiscoveredService
+        do {
+            service = try await discovery.discover()
+            print("[RelayService] Discovered bridge at \(service.host):\(service.port)")
+        } catch {
+            print("[RelayService] Discovery failed: \(error)")
+            throw error
+        }
 
         // Configure the HTTP client
         bridgeClient.configure(host: service.host, port: service.port)
 
         // Attempt pairing
-        try await bridgeClient.pair(code: code)
+        do {
+            try await bridgeClient.pair(code: code)
+            print("[RelayService] Pairing successful!")
+        } catch {
+            print("[RelayService] Pairing failed: \(error)")
+            throw error
+        }
 
         // Success
         machineName = service.machineName
         lastConnected = Date()
         isPaired = true
+        connectionState = .connected
 
+        UserDefaults.standard.set(service.host, forKey: "bridge_host")
+        UserDefaults.standard.set(Int(service.port), forKey: "bridge_port")
         UserDefaults.standard.set(service.machineName, forKey: "paired_machine_name")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
+
+        print("[RelayService] isPaired = true, starting event stream")
 
         // Start SSE connection
         startEventStream()
@@ -209,7 +240,7 @@ final class RelayService: ObservableObject {
 
         let line = TerminalLine(text: cleaned, type: .output)
         terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(5)
+        recentTerminalLines = terminalBuffer.getLast(15)
 
         // Batch terminal updates to the watch (1-second window)
         pendingTerminalLines.append(line)
@@ -221,19 +252,100 @@ final class RelayService: ObservableObject {
 
         let permissionId = json["permissionId"] as? String ?? UUID().uuidString
         let toolName = json["tool_name"] as? String ?? "Unknown tool"
-        let description = json["tool_input"] as? String ?? toolName
+        let toolInput = json["tool_input"] as? [String: Any] ?? [:]
 
+        // Build a human-readable description
+        var description = ""
+        var filePath: String? = nil
+
+        switch toolName {
+        case "Edit":
+            filePath = toolInput["file_path"] as? String
+            let filename = ((filePath ?? "") as NSString).lastPathComponent
+            description = "Edit \(filename)"
+        case "Write":
+            filePath = toolInput["file_path"] as? String
+            let filename = ((filePath ?? "") as NSString).lastPathComponent
+            description = "Create/overwrite \(filename)"
+        case "Bash":
+            let cmd = toolInput["command"] as? String ?? ""
+            description = "Run: \(String(cmd.prefix(100)))"
+        case "Read":
+            filePath = toolInput["file_path"] as? String
+            let filename = ((filePath ?? "") as NSString).lastPathComponent
+            description = "Read \(filename)"
+        default:
+            description = toolName
+        }
+
+        print("[RelayService] Permission requested: \(toolName) — \(description)")
+
+        // Show interactive prompt in the app
+        pendingPermission = PendingPermission(
+            id: permissionId,
+            toolName: toolName,
+            description: description,
+            filePath: filePath
+        )
+
+        // Add to terminal as well
+        let line = TerminalLine(text: "⚠ Permission: \(description)", type: .system)
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+
+        // Forward to watch
         let request = ApprovalRequest(toolName: toolName, actionSummary: description)
-
-        // Forward to watch via sendMessage for immediate delivery
         let message = WatchMessage.approvalRequestMessage(request)
         sessionManager.send(message)
 
-        // Also send a notification if app is backgrounded
+        // Notification if backgrounded
         notificationService.postApprovalNeeded(toolName: toolName, summary: description)
+    }
 
-        // Store permissionId mapping so we can respond
-        UserDefaults.standard.set(permissionId, forKey: "pending_permission_\(request.id.uuidString)")
+    // MARK: - Permission response
+
+    /// "Yes, allow all" — allow this and add a permission rule so it doesn't ask again this session
+    func respondToPermissionAllowAll(permissionId: String) {
+        print("[RelayService] Responding to permission \(permissionId): allow (all session)")
+
+        Task {
+            do {
+                try await bridgeClient.respondToApprovalAllowAll(requestId: permissionId)
+                await MainActor.run {
+                    let line = TerminalLine(text: "✓ Approved (all session)", type: .output)
+                    self.terminalBuffer.append(line)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                    self.pendingPermission = nil
+                }
+            } catch {
+                print("[RelayService] Failed to respond to permission: \(error)")
+            }
+        }
+    }
+
+    func respondToPermission(permissionId: String, allow: Bool) {
+        print("[RelayService] Responding to permission \(permissionId): \(allow ? "allow" : "deny")")
+
+        let decision: [String: Any] = [
+            "behavior": allow ? "allow" : "deny"
+        ]
+
+        Task {
+            do {
+                try await bridgeClient.respondToApproval(requestId: permissionId, allow: allow)
+                await MainActor.run {
+                    let line = TerminalLine(
+                        text: allow ? "✓ Approved" : "✗ Denied",
+                        type: allow ? .output : .error
+                    )
+                    self.terminalBuffer.append(line)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                    self.pendingPermission = nil
+                }
+            } catch {
+                print("[RelayService] Failed to respond to permission: \(error)")
+            }
+        }
     }
 
     private func handleSessionEvent(_ data: String) {
@@ -258,15 +370,89 @@ final class RelayService: ObservableObject {
     private func handleToolOutput(_ data: String) {
         guard let json = parseJSON(data) else { return }
         let toolName = json["tool_name"] as? String ?? "tool"
-        let line = TerminalLine(text: "[\(toolName) completed]", type: .system)
-        terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(5)
+        let toolInput = json["tool_input"] as? [String: Any] ?? [:]
+        let toolOutput = json["tool_output"] as? String
+
+        // Format like a real terminal: show what Claude did and the result
+        var lines: [TerminalLine] = []
+
+        switch toolName {
+        case "Bash":
+            let cmd = toolInput["command"] as? String ?? ""
+            lines.append(TerminalLine(text: "$ \(cmd)", type: .command))
+            if let output = toolOutput, !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Show first ~10 lines of output
+                let outputLines = output.components(separatedBy: "\n")
+                for line in outputLines.prefix(10) {
+                    let cleaned = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty {
+                        lines.append(TerminalLine(text: cleaned, type: .output))
+                    }
+                }
+                if outputLines.count > 10 {
+                    lines.append(TerminalLine(text: "  ... (\(outputLines.count - 10) more lines)", type: .system))
+                }
+            }
+
+        case "Read":
+            let path = toolInput["file_path"] as? String ?? ""
+            let filename = (path as NSString).lastPathComponent
+            lines.append(TerminalLine(text: "Read \(filename)", type: .system))
+
+        case "Write":
+            let path = toolInput["file_path"] as? String ?? ""
+            let filename = (path as NSString).lastPathComponent
+            lines.append(TerminalLine(text: "Write \(filename)", type: .system))
+
+        case "Edit":
+            let path = toolInput["file_path"] as? String ?? ""
+            let filename = (path as NSString).lastPathComponent
+            let oldStr = toolInput["old_string"] as? String ?? ""
+            let newStr = toolInput["new_string"] as? String ?? ""
+            lines.append(TerminalLine(text: "Edit \(filename)", type: .system))
+            if !oldStr.isEmpty {
+                let preview = oldStr.components(separatedBy: "\n").first ?? ""
+                lines.append(TerminalLine(text: "  - \(String(preview.prefix(60)))", type: .error))
+            }
+            if !newStr.isEmpty {
+                let preview = newStr.components(separatedBy: "\n").first ?? ""
+                lines.append(TerminalLine(text: "  + \(String(preview.prefix(60)))", type: .output))
+            }
+
+        case "Grep":
+            let pattern = toolInput["pattern"] as? String ?? ""
+            lines.append(TerminalLine(text: "grep \"\(pattern)\"", type: .command))
+            if let output = toolOutput, !output.isEmpty {
+                let resultLines = output.components(separatedBy: "\n").filter { !$0.isEmpty }
+                lines.append(TerminalLine(text: "  \(resultLines.count) matches", type: .system))
+            }
+
+        case "Glob":
+            let pattern = toolInput["pattern"] as? String ?? ""
+            lines.append(TerminalLine(text: "find \"\(pattern)\"", type: .command))
+
+        default:
+            lines.append(TerminalLine(text: "[\(toolName)]", type: .system))
+            if let output = toolOutput {
+                let preview = String(output.prefix(100)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !preview.isEmpty {
+                    lines.append(TerminalLine(text: preview, type: .output))
+                }
+            }
+        }
+
+        for line in lines {
+            terminalBuffer.append(line)
+            pendingTerminalLines.append(line)
+        }
+        recentTerminalLines = terminalBuffer.getLast(10)
+        scheduleBatchSend()
     }
 
     private func handleTaskComplete(_ data: String) {
         let line = TerminalLine(text: "Task completed", type: .system)
         terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(5)
+        recentTerminalLines = terminalBuffer.getLast(15)
         notificationService.postTaskComplete()
         updateWatchState()
     }
@@ -276,13 +462,13 @@ final class RelayService: ObservableObject {
         let errorMsg = json["error"] as? String ?? "Unknown error"
         let line = TerminalLine(text: errorMsg, type: .error)
         terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(5)
+        recentTerminalLines = terminalBuffer.getLast(15)
     }
 
     private func handleStop(_ data: String) {
         let line = TerminalLine(text: "Session stopped", type: .system)
         terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(5)
+        recentTerminalLines = terminalBuffer.getLast(15)
         updateWatchState()
     }
 

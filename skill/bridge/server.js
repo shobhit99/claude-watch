@@ -82,6 +82,8 @@ const sseClients = new Set();
 // Permission flow --
 /** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>}>} */
 const pendingPermissions = new Map();
+/** @type {Map<string, Array>} Stores original permission_suggestions per permissionId */
+const pendingPermissionBodies = new Map();
 
 // PTY --
 let ptyProcess = null;
@@ -251,7 +253,16 @@ function spawnClaude(cwd) {
 
 function writeToPty(text) {
   if (!ptyProcess) {
-    throw new Error("No active PTY session");
+    // Auto-spawn Claude when the first command arrives
+    const cwd = process.argv[2] || process.env.HOME || process.cwd();
+    spawnClaude(cwd);
+    // Wait briefly for the PTY to initialize
+    setTimeout(() => {
+      if (ptyProcess) {
+        ptyProcess.stdin.write(text);
+      }
+    }, 500);
+    return;
   }
   ptyProcess.stdin.write(text);
 }
@@ -344,15 +355,23 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  const { command, permissionId, decision } = body;
+  const { command, permissionId, decision, allowAll } = body;
 
-  // Handle permission response from watch
+  // Handle permission response from watch/phone
   if (permissionId && decision) {
+    // If "allow all" was chosen, attach the permission_suggestions from the
+    // original request so Claude Code can auto-add the permission rule.
+    if (allowAll && decision.behavior === "allow") {
+      // Store the original body's permission_suggestions alongside the decision
+      decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
+    }
+    pendingPermissionBodies.delete(permissionId);
+
     const resolved = resolvePermission(permissionId, decision);
     if (!resolved) {
       return jsonResponse(res, 404, { error: "No pending permission with that ID" });
     }
-    log("info", `Permission ${permissionId} resolved: ${decision.behavior}`);
+    log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll ? " (allow all)" : ""}`);
     return jsonResponse(res, 200, { ok: true });
   }
 
@@ -447,19 +466,38 @@ async function handleHookPermission(req, res) {
 
   const permissionId = crypto.randomUUID();
   log("info", `Hook: PermissionRequest received (id: ${permissionId})`, body.tool_name || "");
+  log("info", `Hook: PermissionRequest full body:`, JSON.stringify(body, null, 2));
 
-  // Push to SSE so watch can see and respond
+  // Store permission_suggestions for "allow all" flow
+  if (body.permission_suggestions) {
+    pendingPermissionBodies.set(permissionId, body.permission_suggestions);
+  }
+
+  // Push to SSE so watch/phone can see and respond
   pushSseEvent("permission-request", { permissionId, ...body });
 
   // Block until watch responds or timeout
   const decision = await waitForPermission(permissionId);
 
   log("info", `Hook: PermissionRequest resolved (id: ${permissionId}): ${decision.behavior}`);
-  return jsonResponse(res, 200, {
+
+  const hookResponse = {
     hookSpecificOutput: {
-      decision,
+      hookEventName: "PermissionRequest",
+      decision: { behavior: decision.behavior },
     },
-  });
+  };
+
+  // If "allow all", include updatedPermissions so Claude adds the rule
+  if (decision.updatedPermissions && decision.updatedPermissions.length > 0) {
+    hookResponse.hookSpecificOutput.decision.updatedPermissions = decision.updatedPermissions;
+  }
+
+  if (decision.behavior === "deny" && decision.message) {
+    hookResponse.hookSpecificOutput.decision.message = decision.message;
+  }
+
+  return jsonResponse(res, 200, hookResponse);
 }
 
 async function handleHookStop(req, res) {
@@ -607,9 +645,9 @@ async function startServer() {
 
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
 
-  // Spawn Claude PTY
-  const cwd = process.argv[2] || process.cwd();
-  spawnClaude(cwd);
+  // PTY is spawned on-demand when the first command arrives, not on startup.
+  // This allows the bridge to start independently of any Claude session.
+  log("info", "Bridge ready. PTY will spawn when first command is received.");
 
   // Print pairing info prominently
   console.log("");

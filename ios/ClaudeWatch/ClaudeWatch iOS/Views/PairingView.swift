@@ -147,15 +147,18 @@ struct PairingView: View {
         Task {
             do {
                 try await relayService.pair(code: code)
+                print("[PairingView] Pair succeeded, isPaired=\(relayService.isPaired)")
                 // Success -- RelayService.isPaired will flip, triggering
                 // the app-level transition to ConnectionStatusView.
             } catch let error as BridgeClient.BridgeError {
+                print("[PairingView] BridgeError: \(error)")
                 await MainActor.run {
                     handlePairingError(error)
                 }
             } catch {
+                print("[PairingView] Error: \(error)")
                 await MainActor.run {
-                    showPairingError("Connection failed. Check that the bridge is running.")
+                    showPairingError("Connection failed: \(error.localizedDescription)")
                 }
             }
         }

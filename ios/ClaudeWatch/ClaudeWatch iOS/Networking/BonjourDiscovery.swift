@@ -45,12 +45,46 @@ final class BonjourDiscovery: ObservableObject {
     // MARK: - Discovery
 
     /// Searches for the bridge service on LAN with a 5-second timeout.
-    /// Returns the first discovered service, or throws on failure.
+    /// Falls back to localhost:7860 if Bonjour fails (common on simulator).
     @MainActor
     func discover() async throws -> DiscoveredService {
         isSearching = true
         defer { isSearching = false }
 
+        // Try Bonjour first, fall back to localhost
+        do {
+            return try await bonjourDiscover()
+        } catch {
+            print("[BonjourDiscovery] Bonjour failed (\(error.localizedDescription)), trying localhost fallback...")
+            return try await localhostFallback()
+        }
+    }
+
+    /// Tries to connect to localhost:7860-7869 directly.
+    private func localhostFallback() async throws -> DiscoveredService {
+        for port in UInt16(7860)...UInt16(7869) {
+            let url = URL(string: "http://127.0.0.1:\(port)/status")!
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 2
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                    return DiscoveredService(
+                        name: "localhost",
+                        host: "127.0.0.1",
+                        port: port,
+                        machineName: ProcessInfo.processInfo.hostName
+                    )
+                }
+            } catch {
+                continue
+            }
+        }
+        throw DiscoveryError.noServiceFound
+    }
+
+    /// Bonjour-based discovery.
+    private func bonjourDiscover() async throws -> DiscoveredService {
         return try await withCheckedThrowingContinuation { continuation in
             var hasResumed = false
             let lock = NSLock()
@@ -137,9 +171,14 @@ final class BonjourDiscovery: ObservableObject {
             case .ready:
                 if let endpoint = connection.currentPath?.remoteEndpoint,
                    case let .hostPort(host, port) = endpoint {
+                    // Strip interface scope suffix (e.g. "192.168.1.4%en0" → "192.168.1.4")
+                    var hostString = "\(host)"
+                    if let pctIndex = hostString.firstIndex(of: "%") {
+                        hostString = String(hostString[..<pctIndex])
+                    }
                     let service = DiscoveredService(
                         name: name,
-                        host: "\(host)",
+                        host: hostString,
                         port: port.rawValue,
                         machineName: name
                     )

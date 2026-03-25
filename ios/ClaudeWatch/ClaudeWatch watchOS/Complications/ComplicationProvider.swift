@@ -54,7 +54,7 @@ struct ClaudeWatchTimelineProvider: TimelineProvider {
     }
 
     private func currentEntry() -> ClaudeWatchEntry {
-        let session = WatchSessionManager.shared
+        let session = WatchViewState.shared
 
         let status: ClaudeWatchEntry.Status
         switch session.sessionState.connection {

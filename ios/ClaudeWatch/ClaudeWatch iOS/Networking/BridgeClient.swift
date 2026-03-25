@@ -119,12 +119,28 @@ final class BridgeClient {
 
     /// Responds to an approval request.
     func respondToApproval(requestId: String, allow: Bool) async throws {
-        let decision: [String: Any] = [
+        var decision: [String: Any] = [
             "behavior": allow ? "allow" : "deny"
         ]
+        if !allow {
+            decision["message"] = "Denied from Claude Watch app"
+        }
         let body: [String: Any] = [
             "permissionId": requestId,
             "decision": decision
+        ]
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    /// Responds with "allow" + adds a permission rule so it doesn't ask again this session.
+    func respondToApprovalAllowAll(requestId: String) async throws {
+        let decision: [String: Any] = [
+            "behavior": "allow"
+        ]
+        let body: [String: Any] = [
+            "permissionId": requestId,
+            "decision": decision,
+            "allowAll": true
         ]
         try await authenticatedPostRaw(path: "command", body: body)
     }

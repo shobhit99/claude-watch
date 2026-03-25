@@ -16,6 +16,11 @@ struct ConnectionStatusView: View {
 
                 VStack(spacing: 16) {
                     header
+
+                    if relayService.pendingPermission != nil {
+                        permissionPrompt
+                    }
+
                     statusCard
                     terminalOutput
                     Spacer()
@@ -137,6 +142,72 @@ struct ConnectionStatusView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
+    // MARK: - Permission prompt
+
+    private var permissionPrompt: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let permission = relayService.pendingPermission {
+                // Compact header + description in one line
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Color.claudeAmber)
+                        .font(.system(size: 14))
+                    Text(permission.description)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Spacer()
+                }
+
+                // All 3 options in a row, matching terminal UI
+                HStack(spacing: 8) {
+                    Button {
+                        relayService.respondToPermission(permissionId: permission.id, allow: true)
+                    } label: {
+                        Text("Yes")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                            .background(Color.statusGreen)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    Button {
+                        relayService.respondToPermissionAllowAll(permissionId: permission.id)
+                    } label: {
+                        Text("Yes, all")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                            .background(Color.claudeOrange)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    Button {
+                        relayService.respondToPermission(permissionId: permission.id, allow: false)
+                    } label: {
+                        Text("No")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                            .background(Color.red.opacity(0.8))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(hex: "1a1a1a"))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.claudeAmber.opacity(0.3), lineWidth: 1)
+        )
+    }
+
     // MARK: - Terminal output
 
     private var terminalOutput: some View {
@@ -146,11 +217,14 @@ struct ConnectionStatusView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Color.subtleText)
                 Spacer()
+                Text("\(relayService.recentTerminalLines.count) lines")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Color.subtleText.opacity(0.6))
             }
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(relayService.recentTerminalLines) { line in
                             terminalLineView(line)
                                 .id(line.id)
@@ -158,7 +232,7 @@ struct ConnectionStatusView: View {
                     }
                     .padding(12)
                 }
-                .frame(maxHeight: 200)
+                .frame(maxWidth: .infinity)
                 .background(Color.cardBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .onChange(of: relayService.recentTerminalLines.count) { _, _ in
