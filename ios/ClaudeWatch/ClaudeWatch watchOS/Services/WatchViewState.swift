@@ -19,10 +19,35 @@ class WatchViewState: ObservableObject {
     private var sseTask: URLSessionDataTask?
 
     private init() {
-        // Restore pairing state
+        // Verify saved credentials by checking the bridge
         if bridge.isPaired {
-            isPaired = true
-            startEventStream()
+            Task {
+                let reachable = await verifyBridge()
+                await MainActor.run {
+                    if reachable {
+                        isPaired = true
+                        startEventStream()
+                    } else {
+                        // Bridge unreachable — clear stale credentials
+                        bridge.unpair()
+                        isPaired = false
+                    }
+                }
+            }
+        }
+    }
+
+    private func verifyBridge() async -> Bool {
+        guard let baseURL = bridge.baseURL, let token = bridge.token else { return false }
+        let url = baseURL.appendingPathComponent("status")
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 3
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
         }
     }
 
@@ -140,15 +165,51 @@ class WatchViewState: ObservableObject {
             let toolName = json["tool_name"] as? String ?? "Unknown"
             let toolInput = json["tool_input"] as? [String: Any] ?? [:]
 
+            var question: String? = nil
             var desc = toolName
-            if let path = toolInput["file_path"] as? String {
+            var options: [ApprovalRequest.OptionItem] = []
+
+            // Parse AskUserQuestion format
+            if let questions = toolInput["questions"] as? [[String: Any]],
+               let firstQ = questions.first {
+                question = firstQ["question"] as? String
+                desc = firstQ["header"] as? String ?? toolName
+
+                if let opts = firstQ["options"] as? [[String: Any]] {
+                    options = opts.map { opt in
+                        ApprovalRequest.OptionItem(
+                            label: opt["label"] as? String ?? "",
+                            description: opt["description"] as? String
+                        )
+                    }
+                }
+            }
+            // Fallback for Edit/Bash/etc permission prompts
+            else if let path = toolInput["file_path"] as? String {
                 desc = "\(toolName) \((path as NSString).lastPathComponent)"
+                options = [
+                    ApprovalRequest.OptionItem(label: "Yes"),
+                    ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                    ApprovalRequest.OptionItem(label: "No"),
+                ]
             } else if let cmd = toolInput["command"] as? String {
                 desc = "Run: \(String(cmd.prefix(50)))"
+                options = [
+                    ApprovalRequest.OptionItem(label: "Yes"),
+                    ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                    ApprovalRequest.OptionItem(label: "No"),
+                ]
+            } else {
+                options = [
+                    ApprovalRequest.OptionItem(label: "Yes"),
+                    ApprovalRequest.OptionItem(label: "No"),
+                ]
             }
 
-            pendingApproval = ApprovalRequest(toolName: toolName, actionSummary: desc)
-            // Store the bridge permissionId for responding
+            pendingApproval = ApprovalRequest(
+                toolName: toolName, actionSummary: desc,
+                question: question, options: options
+            )
             UserDefaults.standard.set(permissionId, forKey: "watch_pending_permission")
             HapticManager.approvalNeeded()
 
@@ -184,6 +245,32 @@ class WatchViewState: ObservableObject {
     }
 
     // MARK: - Permission response
+
+    /// Respond with a specific option label (for AskUserQuestion)
+    func respondToPermissionWithOption(_ optionLabel: String) {
+        guard let permissionId = UserDefaults.standard.string(forKey: "watch_pending_permission"),
+              let baseURL = bridge.baseURL, let token = bridge.token else { return }
+
+        pendingApproval = nil
+
+        let url = baseURL.appendingPathComponent("command")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        // For AskUserQuestion, we send "allow" with the selected option
+        let body: [String: Any] = [
+            "permissionId": permissionId,
+            "decision": ["behavior": "allow"],
+            "selectedOption": optionLabel
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request).resume()
+        appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command))
+        UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
+    }
 
     func respondToPermission(approved: Bool) {
         guard let permissionId = UserDefaults.standard.string(forKey: "watch_pending_permission"),

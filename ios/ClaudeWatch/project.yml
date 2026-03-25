@@ -9,11 +9,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-  configs:
-    Debug:
-      ONLY_ACTIVE_ARCH: true
-    Release:
-      ONLY_ACTIVE_ARCH: false
+    ONLY_ACTIVE_ARCH: true
 
 targets:
   ClaudeWatch:
@@ -46,6 +42,7 @@ targets:
         GENERATE_INFOPLIST_FILE: false
         SUPPORTS_MACCATALYST: false
         ARCHS: "arm64 arm64e arm64_32"
+        "EXCLUDED_ARCHS[sdk=watchsimulator*]": arm64e
 
 schemes:
   ClaudeWatch:

@@ -1,7 +1,5 @@
 import SwiftUI
 
-// MARK: - SessionView
-
 struct SessionView: View {
     @EnvironmentObject private var session: WatchViewState
 
@@ -11,9 +9,8 @@ struct SessionView: View {
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            // Full-screen terminal
             VStack(spacing: 0) {
-                // Thin top bar
+                // Top bar
                 HStack(spacing: 4) {
                     ClaudeMascot(size: 14)
                     Text("Claude")
@@ -27,14 +24,13 @@ struct SessionView: View {
                 .padding(.horizontal, 4)
                 .padding(.bottom, 2)
 
-                // Terminal fills everything
+                // Terminal — use regular VStack (not Lazy) to avoid blank flashes
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
-                        LazyVStack(alignment: .leading, spacing: 1) {
-                            ForEach(session.terminalLines) { line in
-                                Text(line.text)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(colorFor(line.type))
+                        VStack(alignment: .leading, spacing: 1) {
+                            // Only show last 30 lines to keep performance stable
+                            ForEach(visibleLines) { line in
+                                terminalLine(line)
                                     .id(line.id)
                             }
 
@@ -43,23 +39,29 @@ struct SessionView: View {
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundColor(Theme.Text.primary)
                                     .onReceive(cursorTimer) { _ in cursorVisible.toggle() }
+                                    .id("cursor")
                             }
 
-                            // Bottom padding so content isn't hidden behind FAB
-                            Color.clear.frame(height: 40)
+                            // Spacer for FAB
+                            Spacer().frame(height: 40)
                         }
                         .padding(.horizontal, 4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .onChange(of: session.terminalLines.count) { _ in
-                        if let last = session.terminalLines.last {
-                            proxy.scrollTo(last.id, anchor: .bottom)
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            if isThinking {
+                                proxy.scrollTo("cursor", anchor: .bottom)
+                            } else if let last = visibleLines.last {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
                         }
                     }
                 }
             }
             .background(Theme.Background.primary)
 
-            // Floating mic button — bottom right, small with transparency
+            // FAB mic
             Button { showVoiceInput = true } label: {
                 ZStack {
                     Circle()
@@ -82,6 +84,24 @@ struct SessionView: View {
         .fullScreenCover(isPresented: $showVoiceInput) {
             VoiceInputView()
         }
+    }
+
+    // Only render last 30 lines, skip empty/thinking lines
+    private var visibleLines: [TerminalLine] {
+        session.terminalLines
+            .filter { !$0.text.isEmpty || $0.type == .thinking }
+            .suffix(30)
+            .map { $0 } // convert Slice to Array
+    }
+
+    @ViewBuilder
+    private func terminalLine(_ line: TerminalLine) -> some View {
+        Text(line.text)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundColor(colorFor(line.type))
+            .lineLimit(4)
+            .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var isThinking: Bool {
