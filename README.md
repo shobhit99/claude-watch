@@ -1,6 +1,19 @@
-# Claude Watch
+<p align="center">
+  <img src="logo.png" width="140" alt="Claude Logo" />
+</p>
 
-Control Claude Code from your Apple Watch. See terminal output, approve permissions, and send voice commands — all from your wrist.
+<h1 align="center"><strong>Claude Watch</strong></h1>
+
+<p align="center">
+  Control Claude Code from your Apple Watch.<br/>
+  See terminal output, approve permissions, and send voice commands — all from your wrist.
+</p>
+
+<p align="center">
+  <img src="photo.png" width="600" alt="Claude Watch on Apple Watch" />
+</p>
+
+---
 
 ```
                     WCSession
