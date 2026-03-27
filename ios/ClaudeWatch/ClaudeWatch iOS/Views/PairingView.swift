@@ -6,8 +6,8 @@ struct PairingView: View {
 
     // MARK: - State
 
-    @State private var digits: [String] = Array(repeating: "", count: 6)
-    @FocusState private var focusedField: Int?
+    @State private var code: String = ""
+    @FocusState private var isFieldFocused: Bool
     @State private var shakeOffset: CGFloat = 0
     @State private var showError: Bool = false
     @State private var errorMessage: String = ""
@@ -32,6 +32,9 @@ struct PairingView: View {
             }
             .padding(.horizontal, 32)
         }
+        .onTapGesture {
+            isFieldFocused = true
+        }
     }
 
     // MARK: - Subviews
@@ -54,22 +57,40 @@ struct PairingView: View {
     }
 
     private var digitFields: some View {
-        HStack(spacing: 8) {
-            ForEach(0..<6, id: \.self) { index in
-                SingleDigitField(
-                    text: $digits[index],
-                    isError: showError,
-                    isDisabled: isConnecting
-                )
-                .focused($focusedField, equals: index)
-                .onChange(of: digits[index]) { _, newValue in
-                    handleDigitChange(at: index, newValue: newValue)
+        ZStack {
+            // Hidden single TextField that captures all input
+            TextField("", text: $code)
+                .keyboardType(.numberPad)
+                .textContentType(.oneTimeCode)
+                .focused($isFieldFocused)
+                .foregroundStyle(.clear)
+                .tint(.clear)
+                .accentColor(.clear)
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+                .onChange(of: code) { _, newValue in
+                    handleCodeChange(newValue)
+                }
+
+            // Visual digit boxes
+            HStack(spacing: 8) {
+                ForEach(0..<6, id: \.self) { index in
+                    DigitBox(
+                        character: digitAt(index),
+                        isActive: index == code.count && isFieldFocused && !isConnecting,
+                        isError: showError,
+                        isDisabled: isConnecting
+                    )
                 }
             }
+            .offset(x: shakeOffset)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                isFieldFocused = true
+            }
         }
-        .offset(x: shakeOffset)
         .onAppear {
-            focusedField = 0
+            isFieldFocused = true
         }
     }
 
@@ -95,7 +116,7 @@ struct PairingView: View {
     }
 
     private var bottomInstruction: some View {
-        Text("Run /claude-watch in Claude Code to get started")
+        Text("Run `node server.js` in the bridge folder to start")
             .font(.system(size: 13, design: .monospaced))
             .foregroundStyle(Color.subtleText)
             .multilineTextAlignment(.center)
@@ -104,13 +125,16 @@ struct PairingView: View {
 
     // MARK: - Logic
 
-    private func handleDigitChange(at index: Int, newValue: String) {
-        // Only allow single digits
-        let filtered = newValue.filter { $0.isNumber }
-        if filtered.count > 1 {
-            digits[index] = String(filtered.last!)
-        } else {
-            digits[index] = filtered
+    private func digitAt(_ index: Int) -> Character? {
+        guard index < code.count else { return nil }
+        return code[code.index(code.startIndex, offsetBy: index)]
+    }
+
+    private func handleCodeChange(_ newValue: String) {
+        // Only allow digits, max 6
+        let filtered = String(newValue.filter { $0.isNumber }.prefix(6))
+        if filtered != code {
+            code = filtered
         }
 
         // Clear error state on new input
@@ -121,28 +145,20 @@ struct PairingView: View {
             }
         }
 
-        // Auto-advance
-        if !digits[index].isEmpty && index < 5 {
-            focusedField = index + 1
-        }
-
         // Auto-submit when all 6 digits entered
-        let code = digits.joined()
-        if code.count == 6 {
+        if code.count == 6 && !isConnecting {
             submitCode(code)
         }
     }
 
     private func submitCode(_ code: String) {
         isConnecting = true
-        focusedField = nil
+        isFieldFocused = false
 
         Task {
             do {
                 try await relayService.pair(code: code)
                 print("[PairingView] Pair succeeded, isPaired=\(relayService.isPaired)")
-                // Success -- RelayService.isPaired will flip, triggering
-                // the app-level transition to ConnectionStatusView.
             } catch let error as BridgeClient.BridgeError {
                 print("[PairingView] BridgeError: \(error)")
                 await MainActor.run {
@@ -179,13 +195,9 @@ struct PairingView: View {
         withAnimation(.easeInOut(duration: 0.3)) {
             showError = true
         }
-        resetDigits()
-    }
-
-    private func resetDigits() {
-        digits = Array(repeating: "", count: 6)
+        code = ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            focusedField = 0
+            isFieldFocused = true
         }
     }
 
@@ -199,19 +211,17 @@ struct PairingView: View {
     }
 }
 
-// MARK: - Single Digit Field
+// MARK: - Digit Box (display only)
 
-private struct SingleDigitField: View {
+private struct DigitBox: View {
 
-    @Binding var text: String
+    let character: Character?
+    let isActive: Bool
     let isError: Bool
     let isDisabled: Bool
 
     var body: some View {
-        TextField("", text: $text)
-            .keyboardType(.numberPad)
-            .textContentType(.oneTimeCode)
-            .multilineTextAlignment(.center)
+        Text(character.map(String.init) ?? "")
             .font(.system(size: 28, weight: .bold, design: .monospaced))
             .foregroundStyle(isError ? .red : Color.claudeOrange)
             .frame(width: 48, height: 56)
@@ -220,12 +230,11 @@ private struct SingleDigitField: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(
-                        isError ? .red : Color.fieldBorder,
-                        lineWidth: 1
+                        isError ? .red : (isActive ? Color.claudeOrange : Color.fieldBorder),
+                        lineWidth: isActive ? 2 : 1
                     )
             )
             .opacity(isDisabled ? 0.4 : 1.0)
-            .disabled(isDisabled)
     }
 }
 

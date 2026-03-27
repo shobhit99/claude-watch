@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ConnectionStatusView: View {
 
@@ -7,34 +8,29 @@ struct ConnectionStatusView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var showSettings = false
-    @State private var showBackgroundBanner = false
+    @State private var activeSessionIndex = 0
+    @State private var commandText = ""
+    @FocusState private var isCommandFocused: Bool
 
     var body: some View {
         NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                VStack(spacing: 16) {
+                VStack(spacing: 0) {
                     header
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                        .padding(.bottom, 8)
 
-                    if relayService.pendingPermission != nil {
-                        permissionPrompt
-                    }
+                    if relayService.sessions.isEmpty {
+                        waitingView
+                    } else {
+                        sessionPager
 
-                    statusCard
-
-                    if !relayService.sessions.isEmpty {
-                        sessionsSection
-                    }
-
-                    terminalOutput
-                    Spacer()
-                    if showBackgroundBanner {
-                        backgroundBanner
+                        commandInputBar
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -52,18 +48,13 @@ struct ConnectionStatusView: View {
                     .environmentObject(relayService)
             }
         }
-        .onChange(of: scenePhase) { _, newPhase in
-            withAnimation(.easeInOut(duration: 0.3)) {
-                showBackgroundBanner = (newPhase == .inactive)
-            }
-        }
     }
 
     // MARK: - Header
 
     private var header: some View {
         HStack(spacing: 10) {
-            AppLogo(size: 32)
+            AppLogo(size: 28)
 
             Text("Agent Watch")
                 .font(.system(size: 17, weight: .bold))
@@ -90,146 +81,212 @@ struct ConnectionStatusView: View {
         .clipShape(Capsule())
     }
 
-    // MARK: - Status card
+    // MARK: - Waiting for sessions
 
-    private var statusCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var waitingView: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            AppLogo(size: 56)
+                .opacity(0.6)
+            Text("Waiting for session...")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.subtleText)
             Text("Connected to \(relayService.machineName ?? "Mac")")
-                .font(.system(size: 15))
-                .foregroundStyle(Color.claudeOrange)
-
-            if let model = relayService.modelName {
-                Label {
-                    Text(model)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(Color.subtleText)
-                } icon: {
-                    Image(systemName: "cpu")
-                        .foregroundStyle(Color.subtleText)
-                        .font(.system(size: 11))
-                }
-            }
-
-            if let dir = relayService.workingDirectory {
-                Label {
-                    Text(dir)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(Color.subtleText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                } icon: {
-                    Image(systemName: "folder")
-                        .foregroundStyle(Color.subtleText)
-                        .font(.system(size: 11))
-                }
-            }
-
-            HStack(spacing: 4) {
-                Image(systemName: "clock")
-                    .foregroundStyle(Color.subtleText)
-                    .font(.system(size: 11))
-                Text(formattedElapsedTime)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(Color.subtleText)
-            }
+                .font(.system(size: 13))
+                .foregroundStyle(Color.subtleText.opacity(0.6))
+            Spacer()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Color.cardBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Sessions
+    // MARK: - Session pager
 
-    private var sessionsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Sessions")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.subtleText)
+    private var sessionPager: some View {
+        TabView(selection: $activeSessionIndex) {
+            ForEach(Array(relayService.sessions.enumerated()), id: \.element.id) { index, session in
+                SessionPageView(
+                    session: session,
+                    respondToOption: { label, idx in
+                        relayService.respondToApprovalWithOption(label, index: idx)
+                    },
+                    isThinking: relayService.isThinking
+                )
+                .tag(index)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: relayService.sessions.count > 1 ? .automatic : .never))
+        .indexViewStyle(.page(backgroundDisplayMode: .interactive))
+    }
 
-            ForEach(relayService.sessions) { session in
-                HStack(spacing: 10) {
-                    AgentIcon(agent: session.agent, size: 20)
+    // MARK: - Command input bar (outside TabView)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.folderName.isEmpty ? session.agent.rawValue.capitalized : session.folderName)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white)
-                        Text(session.cwd)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color.subtleText)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-
-                    Spacer()
-
-                    Circle()
-                        .fill(session.activity == .running ? Color.statusGreen : Color.subtleText)
-                        .frame(width: 8, height: 8)
-                }
-                .padding(12)
+    private var commandInputBar: some View {
+        HStack(spacing: 8) {
+            TextField("Send a command...", text: $commandText)
+                .font(.system(size: 15, design: .monospaced))
+                .foregroundStyle(.white)
+                .tint(Color.claudeOrange)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
                 .background(Color.cardBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
+                .focused($isCommandFocused)
+                .onSubmit { submitCommand() }
+
+            Button { submitCommand() } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(commandText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? Color.subtleText
+                        : Color.claudeOrange)
             }
+            .disabled(commandText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.black)
+    }
+
+    // MARK: - Helpers
+
+    private func submitCommand() {
+        let text = commandText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let sessionId = relayService.sessions.indices.contains(activeSessionIndex)
+            ? relayService.sessions[activeSessionIndex].id
+            : nil
+        relayService.sendCommand(text: text, sessionId: sessionId)
+        commandText = ""
+    }
+}
+
+// MARK: - Session Page View
+
+private struct SessionPageView: View {
+    let session: AgentSession
+    let respondToOption: (String, Int) -> Void
+    let isThinking: Bool
+
+    @State private var cursorVisible = true
+
+    private let cursorTimer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Session header
+            sessionHeader
+                .padding(.horizontal, 16)
+                .padding(.bottom, 6)
+
+            // Approval prompt (if pending for this session)
+            if let approval = session.pendingApproval {
+                approvalPrompt(approval)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 6)
+            }
+
+            // Terminal
+            terminalView
+                .padding(.horizontal, 16)
         }
     }
 
-    // MARK: - Permission prompt
+    // MARK: - Session header
 
-    private var permissionPrompt: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let permission = relayService.pendingPermission {
-                // Compact header + description in one line
+    private var sessionHeader: some View {
+        HStack(spacing: 8) {
+            AgentIcon(agent: session.agent, size: 18)
+
+            Text(session.folderName.isEmpty ? session.agent.rawValue.capitalized : session.folderName)
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+
+            Text(session.cwd)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Color.subtleText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer()
+
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+        }
+        .padding(12)
+        .background(Color.cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var statusColor: Color {
+        switch session.activity {
+        case .running: return Color.statusGreen
+        case .waitingApproval: return Color.claudeAmber
+        case .ended: return .red
+        case .idle: return Color.subtleText
+        }
+    }
+
+    // MARK: - Approval prompt
+
+    private func approvalPrompt(_ approval: ApprovalRequest) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let question = approval.question {
+                Text(question)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !approval.actionSummary.isEmpty && approval.actionSummary != approval.toolName {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.claudeAmber)
                         .font(.system(size: 14))
-                    Text(permission.description)
+                    Text(approval.actionSummary)
                         .font(.system(size: 13, design: .monospaced))
                         .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Spacer()
+                        .lineLimit(2)
                 }
+            }
 
-                // All 3 options in a row, matching terminal UI
-                HStack(spacing: 8) {
-                    Button {
-                        relayService.respondToPermission(permissionId: permission.id, allow: true)
-                    } label: {
-                        Text("Yes")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 36)
-                            .background(Color.statusGreen)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
+            Divider().background(Color.subtleText.opacity(0.3))
 
-                    Button {
-                        relayService.respondToPermissionAllowAll(permissionId: permission.id)
-                    } label: {
-                        Text("Yes, all")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 36)
-                            .background(Color.claudeOrange)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
+            ForEach(Array(approval.options.enumerated()), id: \.element.id) { index, option in
+                Button {
+                    respondToOption(option.label, index)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("\(index + 1).")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Color.subtleText)
 
-                    Button {
-                        relayService.respondToPermission(permissionId: permission.id, allow: false)
-                    } label: {
-                        Text("No")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 36)
-                            .background(Color.red.opacity(0.8))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(option.label)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+
+                            if let desc = option.description, !desc.isEmpty {
+                                Text(desc)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(Color.subtleText)
+                                    .lineLimit(2)
+                            }
+                        }
+
+                        Spacer()
                     }
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 12)
+                    .background(colorForOption(index, total: approval.options.count).opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(colorForOption(index, total: approval.options.count).opacity(0.3), lineWidth: 1)
+                    )
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(12)
@@ -241,50 +298,46 @@ struct ConnectionStatusView: View {
         )
     }
 
-    // MARK: - Terminal output
+    // MARK: - Terminal
 
-    private var terminalOutput: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Terminal")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.subtleText)
-                Spacer()
-                Text("\(relayService.recentTerminalLines.count) lines")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Color.subtleText.opacity(0.6))
-            }
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(relayService.recentTerminalLines) { line in
-                            terminalLineView(line)
-                                .id(line.id)
-                        }
+    private var terminalView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(session.terminalLines.suffix(50)) { line in
+                        Text(line.text)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(colorForLineType(line.type))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(line.id)
                     }
-                    .padding(12)
+
+                    if isThinking {
+                        Text(cursorVisible ? "\u{2588}" : " ")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(Color.claudeOrange)
+                            .onReceive(cursorTimer) { _ in cursorVisible.toggle() }
+                            .id("thinking-cursor")
+                    }
                 }
-                .frame(maxWidth: .infinity)
-                .background(Color.cardBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .onChange(of: relayService.recentTerminalLines.count) { _, _ in
-                    if let lastLine = relayService.recentTerminalLines.last {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(lastLine.id, anchor: .bottom)
-                        }
+                .padding(12)
+            }
+            .frame(maxWidth: .infinity)
+            .background(Color.cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .onChange(of: session.terminalLines.count) { _, _ in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    if isThinking {
+                        proxy.scrollTo("thinking-cursor", anchor: .bottom)
+                    } else if let last = session.terminalLines.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
             }
         }
     }
 
-    private func terminalLineView(_ line: TerminalLine) -> some View {
-        Text(line.text)
-            .font(.system(size: 13, design: .monospaced))
-            .foregroundStyle(colorForLineType(line.type))
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
+    // MARK: - Helpers
 
     private func colorForLineType(_ type: TerminalLine.LineType) -> Color {
         switch type {
@@ -296,32 +349,11 @@ struct ConnectionStatusView: View {
         }
     }
 
-    // MARK: - Background banner
-
-    private var backgroundBanner: some View {
-        Text("Keep this app open for real-time relay to your Watch")
-            .font(.system(size: 13))
-            .foregroundStyle(Color.claudeAmber)
-            .multilineTextAlignment(.center)
-            .padding(12)
-            .frame(maxWidth: .infinity)
-            .background(Color.cardBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .padding(.bottom, 8)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-    }
-
-    // MARK: - Helpers
-
-    private var formattedElapsedTime: String {
-        let total = relayService.elapsedSeconds
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let seconds = total % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
-        }
-        return String(format: "%d:%02d", minutes, seconds)
+    private func colorForOption(_ index: Int, total: Int) -> Color {
+        if total <= 1 { return Color.statusGreen }
+        if index == 0 { return Color.statusGreen }
+        if index == total - 1 { return .red }
+        return Color.claudeOrange
     }
 }
 

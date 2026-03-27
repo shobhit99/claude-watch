@@ -153,6 +153,17 @@ final class BridgeClient {
         try await authenticatedPostRaw(path: "command", body: body)
     }
 
+    /// Responds to an approval with a selected option (for dynamic options / AskUserQuestion).
+    func respondToApprovalWithOption(requestId: String, optionLabel: String, index: Int) async throws {
+        let body: [String: Any] = [
+            "permissionId": requestId,
+            "decision": ["behavior": "allow"],
+            "selectedOption": optionLabel,
+            "optionIndex": index
+        ]
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
     /// Responds with "allow" + adds a permission rule so it doesn't ask again this session.
     func respondToApprovalAllowAll(requestId: String) async throws {
         let decision: [String: Any] = [

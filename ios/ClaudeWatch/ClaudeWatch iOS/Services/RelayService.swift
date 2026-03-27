@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 /// Coordinates communication between the bridge server, SSE event stream,
 /// and the Apple Watch via WCSession.
@@ -24,20 +25,13 @@ final class RelayService: ObservableObject {
     @Published private(set) var recentTerminalLines: [TerminalLine] = []
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var lastConnected: Date?
+    @Published private(set) var isThinking: Bool = false
 
     // Multi-session
     @Published private(set) var sessions: [AgentSession] = []
 
-    // Permission prompt state
-    @Published var pendingPermission: PendingPermission? = nil
-
-    struct PendingPermission: Identifiable {
-        let id: String // permissionId from bridge
-        let toolName: String
-        let description: String
-        let filePath: String?
-        let timestamp: Date = Date()
-    }
+    // Permission prompt state (uses shared ApprovalRequest model)
+    @Published var pendingApproval: ApprovalRequest? = nil
 
     // MARK: - Private
 
@@ -231,6 +225,7 @@ final class RelayService: ObservableObject {
     private func handlePtyOutput(_ data: String) {
         guard let json = parseJSON(data),
               let text = json["text"] as? String else { return }
+        let sessionId = json["sessionId"] as? String
 
         // Strip ANSI escape codes for display
         let cleaned = text.replacingOccurrences(
@@ -241,9 +236,10 @@ final class RelayService: ObservableObject {
 
         guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
-        let line = TerminalLine(text: cleaned, type: .output)
+        let line = TerminalLine(text: cleaned, type: .output, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
 
         // Batch terminal updates to the watch (1-second window)
         pendingTerminalLines.append(line)
@@ -254,100 +250,162 @@ final class RelayService: ObservableObject {
         guard let json = parseJSON(data) else { return }
 
         let permissionId = json["permissionId"] as? String ?? UUID().uuidString
-        let toolName = json["tool_name"] as? String ?? "Unknown tool"
+        let toolName = json["tool_name"] as? String ?? "Unknown"
         let toolInput = json["tool_input"] as? [String: Any] ?? [:]
+        let sessionId = json["sessionId"] as? String
 
-        // Build a human-readable description
-        var description = ""
-        var filePath: String? = nil
+        var question: String? = nil
+        var desc = toolName
+        var options: [ApprovalRequest.OptionItem] = []
 
-        switch toolName {
-        case "Edit":
-            filePath = toolInput["file_path"] as? String
-            let filename = ((filePath ?? "") as NSString).lastPathComponent
-            description = "Edit \(filename)"
-        case "Write":
-            filePath = toolInput["file_path"] as? String
-            let filename = ((filePath ?? "") as NSString).lastPathComponent
-            description = "Create/overwrite \(filename)"
-        case "Bash":
-            let cmd = toolInput["command"] as? String ?? ""
-            description = "Run: \(String(cmd.prefix(100)))"
-        case "Read":
-            filePath = toolInput["file_path"] as? String
-            let filename = ((filePath ?? "") as NSString).lastPathComponent
-            description = "Read \(filename)"
-        default:
-            description = toolName
+        // Parse questions/options (Codex format with questions array)
+        if let questions = toolInput["questions"] as? [[String: Any]],
+           let firstQ = questions.first {
+            question = firstQ["question"] as? String
+            desc = toolInput["command"] as? String
+                ?? firstQ["header"] as? String
+                ?? toolName
+            if let opts = firstQ["options"] as? [[String: Any]] {
+                options = opts.map { opt in
+                    ApprovalRequest.OptionItem(
+                        label: opt["label"] as? String ?? "",
+                        description: opt["description"] as? String
+                    )
+                }
+            }
+        } else if let path = toolInput["file_path"] as? String {
+            let filename = (path as NSString).lastPathComponent
+            desc = "\(toolName) \(filename)"
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
+        } else if let cmd = toolInput["command"] as? String {
+            desc = "Run: \(String(cmd.prefix(100)))"
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
+        } else {
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
         }
 
-        print("[RelayService] Permission requested: \(toolName) — \(description)")
+        print("[RelayService] Permission requested: \(toolName) — \(desc)")
 
-        // Show interactive prompt in the app
-        pendingPermission = PendingPermission(
-            id: permissionId,
+        let approval = ApprovalRequest(
+            permissionId: permissionId,
             toolName: toolName,
-            description: description,
-            filePath: filePath
+            actionSummary: desc,
+            question: question,
+            options: options
         )
 
-        // Add to terminal as well
-        let line = TerminalLine(text: "⚠ Permission: \(description)", type: .system)
+        pendingApproval = approval
+
+        // Track on specific session
+        if let sid = sessionId, let idx = sessions.firstIndex(where: { $0.id == sid }) {
+            sessions[idx].pendingApproval = approval
+            sessions[idx].activity = .waitingApproval
+        }
+
+        // Haptic feedback
+        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+
+        // Add to terminal
+        let line = TerminalLine(text: "⚠ Permission: \(desc)", type: .system, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
 
         // Forward to watch
-        let request = ApprovalRequest(toolName: toolName, actionSummary: description)
-        let message = WatchMessage.approvalRequestMessage(request)
+        let watchRequest = ApprovalRequest(toolName: toolName, actionSummary: desc, question: question, options: options)
+        let message = WatchMessage.approvalRequestMessage(watchRequest)
         sessionManager.send(message)
 
         // Notification if backgrounded
-        notificationService.postApprovalNeeded(toolName: toolName, summary: description)
+        notificationService.postApprovalNeeded(toolName: toolName, summary: desc)
     }
 
     // MARK: - Permission response
 
-    /// "Yes, allow all" — allow this and add a permission rule so it doesn't ask again this session
-    func respondToPermissionAllowAll(permissionId: String) {
-        print("[RelayService] Responding to permission \(permissionId): allow (all session)")
+    /// Respond to approval with a selected option (dynamic options from server).
+    func respondToApprovalWithOption(_ optionLabel: String, index: Int) {
+        guard let approval = pendingApproval else { return }
+        let permissionId = approval.permissionId ?? ""
+
+        let isLast = index == approval.options.count - 1
+        UIImpactFeedbackGenerator(style: isLast ? .heavy : .medium).impactOccurred()
+
+        if approval.question != nil {
+            // AskUserQuestion: send the option label
+            Task {
+                try? await bridgeClient.respondToApprovalWithOption(
+                    requestId: permissionId, optionLabel: optionLabel, index: index
+                )
+            }
+        } else {
+            // Standard permission: first = allow, last = deny, middle = allow all
+            if optionLabel.lowercased().contains("allow all") || optionLabel.lowercased().contains("don't ask") {
+                Task { try? await bridgeClient.respondToApprovalAllowAll(requestId: permissionId) }
+            } else {
+                let approved = !isLast
+                Task { try? await bridgeClient.respondToApproval(requestId: permissionId, allow: approved) }
+            }
+        }
+
+        let line = TerminalLine(text: "→ \(optionLabel)", type: isLast ? .error : .output)
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+
+        clearPendingApproval(for: approval)
+    }
+
+    // MARK: - Send command
+
+    /// Sends a text command to the bridge (iOS equivalent of watchOS voice input).
+    func sendCommand(text: String, sessionId: String? = nil) {
+        let sid = sessionId ?? sessions.first(where: { $0.activity == .running })?.id
+
+        // Show in terminal
+        let cmdLine = TerminalLine(text: "> \(text)", type: .command, sessionId: sid)
+        terminalBuffer.append(cmdLine)
+        appendToSession(cmdLine, sessionId: sid)
+        recentTerminalLines = terminalBuffer.getLast(15)
+
+        isThinking = true
+
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
         Task {
-            do {
-                try await bridgeClient.respondToApprovalAllowAll(requestId: permissionId)
-                await MainActor.run {
-                    let line = TerminalLine(text: "✓ Approved (all session)", type: .output)
-                    self.terminalBuffer.append(line)
-                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
-                    self.pendingPermission = nil
+            try? await bridgeClient.sendCommand(text: text + "\n", sessionId: sid)
+        }
+    }
+
+    // MARK: - Helpers (approval)
+
+    private func clearPendingApproval(for approval: ApprovalRequest) {
+        pendingApproval = nil
+        for idx in sessions.indices {
+            if sessions[idx].pendingApproval?.permissionId == approval.permissionId {
+                sessions[idx].pendingApproval = nil
+                if sessions[idx].activity == .waitingApproval {
+                    sessions[idx].activity = .running
                 }
-            } catch {
-                print("[RelayService] Failed to respond to permission: \(error)")
             }
         }
     }
 
-    func respondToPermission(permissionId: String, allow: Bool) {
-        print("[RelayService] Responding to permission \(permissionId): \(allow ? "allow" : "deny")")
-
-        let decision: [String: Any] = [
-            "behavior": allow ? "allow" : "deny"
-        ]
-
-        Task {
-            do {
-                try await bridgeClient.respondToApproval(requestId: permissionId, allow: allow)
-                await MainActor.run {
-                    let line = TerminalLine(
-                        text: allow ? "✓ Approved" : "✗ Denied",
-                        type: allow ? .output : .error
-                    )
-                    self.terminalBuffer.append(line)
-                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
-                    self.pendingPermission = nil
-                }
-            } catch {
-                print("[RelayService] Failed to respond to permission: \(error)")
-            }
+    private func appendToSession(_ line: TerminalLine, sessionId: String?) {
+        guard let sid = sessionId,
+              let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+        sessions[idx].terminalLines.append(line)
+        if sessions[idx].terminalLines.count > 200 {
+            sessions[idx].terminalLines.removeFirst(sessions[idx].terminalLines.count - 200)
         }
     }
 
@@ -375,6 +433,7 @@ final class RelayService: ObservableObject {
                 }
             }
         case "ended":
+            isThinking = false
             stopElapsedTimer()
             notificationService.postTaskComplete()
             if let sid = sessionId, let idx = sessions.firstIndex(where: { $0.id == sid }) {
@@ -394,6 +453,9 @@ final class RelayService: ObservableObject {
         let toolName = json["tool_name"] as? String ?? "tool"
         let toolInput = json["tool_input"] as? [String: Any] ?? [:]
         let toolOutput = json["tool_output"] as? String
+        let sessionId = json["sessionId"] as? String
+        let source = json["source"] as? String ?? "claude"
+        let prefix = source == "codex" ? "[codex] " : ""
 
         // Format like a real terminal: show what Claude did and the result
         var lines: [TerminalLine] = []
@@ -401,64 +463,68 @@ final class RelayService: ObservableObject {
         switch toolName {
         case "Bash":
             let cmd = toolInput["command"] as? String ?? ""
-            lines.append(TerminalLine(text: "$ \(cmd)", type: .command))
+            lines.append(TerminalLine(text: "\(prefix)$ \(cmd)", type: .command, sessionId: sessionId))
             if let output = toolOutput, !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Show first ~10 lines of output
                 let outputLines = output.components(separatedBy: "\n")
                 for line in outputLines.prefix(10) {
                     let cleaned = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !cleaned.isEmpty {
-                        lines.append(TerminalLine(text: cleaned, type: .output))
+                        lines.append(TerminalLine(text: cleaned, type: .output, sessionId: sessionId))
                     }
                 }
                 if outputLines.count > 10 {
-                    lines.append(TerminalLine(text: "  ... (\(outputLines.count - 10) more lines)", type: .system))
+                    lines.append(TerminalLine(text: "  ... (\(outputLines.count - 10) more lines)", type: .system, sessionId: sessionId))
                 }
             }
 
         case "Read":
             let path = toolInput["file_path"] as? String ?? ""
             let filename = (path as NSString).lastPathComponent
-            lines.append(TerminalLine(text: "Read \(filename)", type: .system))
+            lines.append(TerminalLine(text: "\(prefix)Read \(filename)", type: .system, sessionId: sessionId))
 
         case "Write":
             let path = toolInput["file_path"] as? String ?? ""
             let filename = (path as NSString).lastPathComponent
-            lines.append(TerminalLine(text: "Write \(filename)", type: .system))
+            lines.append(TerminalLine(text: "\(prefix)Write \(filename)", type: .system, sessionId: sessionId))
 
         case "Edit":
             let path = toolInput["file_path"] as? String ?? ""
             let filename = (path as NSString).lastPathComponent
             let oldStr = toolInput["old_string"] as? String ?? ""
             let newStr = toolInput["new_string"] as? String ?? ""
-            lines.append(TerminalLine(text: "Edit \(filename)", type: .system))
+            lines.append(TerminalLine(text: "\(prefix)Edit \(filename)", type: .system, sessionId: sessionId))
             if !oldStr.isEmpty {
                 let preview = oldStr.components(separatedBy: "\n").first ?? ""
-                lines.append(TerminalLine(text: "  - \(String(preview.prefix(60)))", type: .error))
+                lines.append(TerminalLine(text: "  - \(String(preview.prefix(60)))", type: .error, sessionId: sessionId))
             }
             if !newStr.isEmpty {
                 let preview = newStr.components(separatedBy: "\n").first ?? ""
-                lines.append(TerminalLine(text: "  + \(String(preview.prefix(60)))", type: .output))
+                lines.append(TerminalLine(text: "  + \(String(preview.prefix(60)))", type: .output, sessionId: sessionId))
             }
 
         case "Grep":
             let pattern = toolInput["pattern"] as? String ?? ""
-            lines.append(TerminalLine(text: "grep \"\(pattern)\"", type: .command))
+            lines.append(TerminalLine(text: "\(prefix)grep \"\(pattern)\"", type: .command, sessionId: sessionId))
             if let output = toolOutput, !output.isEmpty {
                 let resultLines = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-                lines.append(TerminalLine(text: "  \(resultLines.count) matches", type: .system))
+                lines.append(TerminalLine(text: "  \(resultLines.count) matches", type: .system, sessionId: sessionId))
             }
 
         case "Glob":
             let pattern = toolInput["pattern"] as? String ?? ""
-            lines.append(TerminalLine(text: "find \"\(pattern)\"", type: .command))
+            lines.append(TerminalLine(text: "\(prefix)find \"\(pattern)\"", type: .command, sessionId: sessionId))
+
+        case "CodexMessage":
+            if let output = toolOutput {
+                lines.append(TerminalLine(text: "\(prefix)\(String(output.prefix(100)))", type: .output, sessionId: sessionId))
+            }
 
         default:
-            lines.append(TerminalLine(text: "[\(toolName)]", type: .system))
+            lines.append(TerminalLine(text: "\(prefix)[\(toolName)]", type: .system, sessionId: sessionId))
             if let output = toolOutput {
                 let preview = String(output.prefix(100)).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !preview.isEmpty {
-                    lines.append(TerminalLine(text: preview, type: .output))
+                    lines.append(TerminalLine(text: preview, type: .output, sessionId: sessionId))
                 }
             }
         }
@@ -466,12 +532,18 @@ final class RelayService: ObservableObject {
         for line in lines {
             terminalBuffer.append(line)
             pendingTerminalLines.append(line)
+            appendToSession(line, sessionId: sessionId)
         }
+
+        // Mark as thinking (cursor will be shown in the view)
+        isThinking = true
+
         recentTerminalLines = terminalBuffer.getLast(10)
         scheduleBatchSend()
     }
 
     private func handleTaskComplete(_ data: String) {
+        isThinking = false
         let line = TerminalLine(text: "Task completed", type: .system)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
@@ -488,6 +560,7 @@ final class RelayService: ObservableObject {
     }
 
     private func handleStop(_ data: String) {
+        isThinking = false
         let line = TerminalLine(text: "Session stopped", type: .system)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
