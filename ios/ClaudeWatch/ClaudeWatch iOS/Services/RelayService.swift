@@ -25,6 +25,9 @@ final class RelayService: ObservableObject {
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var lastConnected: Date?
 
+    // Multi-session
+    @Published private(set) var sessions: [AgentSession] = []
+
     // Permission prompt state
     @Published var pendingPermission: PendingPermission? = nil
 
@@ -352,12 +355,31 @@ final class RelayService: ObservableObject {
         guard let json = parseJSON(data),
               let state = json["state"] as? String else { return }
 
+        let sessionId = json["sessionId"] as? String
+        let agent = json["agent"] as? String
+        let cwd = json["cwd"] as? String ?? ""
+        let folderName = json["folderName"] as? String ?? ""
+
         switch state {
         case "running":
             sessionStartDate = Date()
+            if let sid = sessionId {
+                if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                    sessions[idx].activity = .running
+                } else {
+                    let agentType = AgentType(rawValue: agent ?? "claude") ?? .claude
+                    sessions.append(AgentSession(
+                        id: sid, agent: agentType, cwd: cwd,
+                        folderName: folderName, activity: .running
+                    ))
+                }
+            }
         case "ended":
             stopElapsedTimer()
             notificationService.postTaskComplete()
+            if let sid = sessionId, let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                sessions[idx].activity = .ended
+            }
         case "connected":
             connectionState = .connected
         default:

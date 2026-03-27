@@ -15,6 +15,9 @@ SETTINGS="$HOME/.claude/settings.json"
 
 # ── Remove mode ──────────────────────────────────────────────────────────────
 if [ "$1" = "--remove" ]; then
+  # Remove codex wrapper
+  rm -f "$HOME/.local/bin/codex-watch" 2>/dev/null && echo "Removed codex-watch wrapper" || true
+
   if [ ! -f "$SETTINGS" ]; then
     echo "No settings file found at $SETTINGS"
     exit 0
@@ -171,11 +174,88 @@ for event in new_hooks:
 "
 
 echo ""
-echo "Done! Every Claude Code session will now stream events to the bridge."
+
+# ── Codex hooks ──────────────────────────────────────────────────────────────
+
+CODEX_CONFIG="$HOME/.codex/config.toml"
+
+if command -v codex &>/dev/null; then
+  echo "Codex detected. Installing Codex hooks..."
+  mkdir -p "$(dirname "$CODEX_CONFIG")"
+
+  # Codex doesn't have HTTP hooks like Claude Code.
+  # Instead, create a wrapper script that pipes --json events to the bridge.
+  WRAPPER="$HOME/.local/bin/codex-watch"
+
+  cat > "$WRAPPER" << 'WRAPPER_EOF'
+#!/bin/bash
+# codex-watch: Runs Codex and streams events to Claude Watch bridge.
+# Drop-in replacement for `codex` — use `codex-watch` instead.
+BRIDGE_URL="http://127.0.0.1:${CLAUDE_WATCH_PORT:-7860}"
+
+# If bridge isn't running, just run codex normally
+if ! curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
+  exec codex "$@"
+fi
+
+# For non-exec commands (login, mcp, etc), run directly
+case "$1" in
+  exec|e) ;; # continue to bridge mode
+  "") ;; # interactive — can't bridge, run normally
+  *) exec codex "$@" ;;
+esac
+
+# Run codex exec with --json and pipe to bridge
+codex "$@" --json 2>/dev/null | while IFS= read -r line; do
+  TYPE=$(echo "$line" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('type',''))" 2>/dev/null || true)
+  case "$TYPE" in
+    item.completed)
+      # Forward the whole event — let the bridge parse it
+      curl -s -X POST "${BRIDGE_URL}/hooks/tool-output" \
+        -H "Content-Type: application/json" \
+        -d "$(echo "$line" | python3 -c "
+import sys,json
+e=json.load(sys.stdin)
+item=e.get('item',{})
+t=item.get('type','')
+out={}
+if t=='command_execution':
+    out={'tool_name':'Bash','tool_input':{'command':item.get('command','')},'tool_output':item.get('aggregated_output',''),'source':'codex'}
+elif t in ('file_edit','file_create'):
+    out={'tool_name':'Edit','tool_input':{'file_path':item.get('file_path','')},'source':'codex'}
+elif t=='file_read':
+    out={'tool_name':'Read','tool_input':{'file_path':item.get('file_path','')},'source':'codex'}
+elif t=='agent_message':
+    out={'tool_name':'CodexMessage','tool_input':{},'tool_output':item.get('text',''),'source':'codex'}
+if out:
+    print(json.dumps(out))
+else:
+    print('{}')
+" 2>/dev/null)" > /dev/null 2>&1 &
+      ;;
+    turn.completed)
+      curl -s -X POST "${BRIDGE_URL}/hooks/stop" \
+        -H "Content-Type: application/json" \
+        -d '{"source":"codex"}' > /dev/null 2>&1 &
+      ;;
+  esac
+done
+WRAPPER_EOF
+
+  chmod +x "$WRAPPER"
+  echo "  Created: $WRAPPER"
+  echo "  Use 'codex-watch exec \"prompt\"' instead of 'codex exec'"
+  echo ""
+else
+  echo "Codex not detected — skipping Codex hooks."
+  echo ""
+fi
+
+echo "Done! Sessions will stream to the bridge."
 echo ""
-echo "To start using:"
-echo "  1. Run the bridge:  cd skill/bridge && node server.js"
-echo "  2. Start any Claude Code session normally"
-echo "  3. Watch events flow into the Claude Watch app"
+echo "Usage:"
+echo "  1. Start bridge:  cd skill/bridge && node server.js"
+echo "  2. Claude Code:   just use normally (hooks auto-forward)"
+echo "  3. Codex:         codex-watch exec \"your prompt\" -s workspace-write"
 echo ""
-echo "To remove hooks:  ./setup-hooks.sh --remove"
+echo "To remove:  ./setup-hooks.sh --remove"

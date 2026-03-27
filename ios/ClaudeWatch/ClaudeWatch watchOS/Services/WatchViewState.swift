@@ -6,11 +6,20 @@ class WatchViewState: ObservableObject {
 
     @Published var isPaired: Bool = false
     @Published var sessionState: SessionState = .disconnected
-    @Published var terminalLines: [TerminalLine] = []
+    @Published var terminalLines: [TerminalLine] = [] // Legacy: flat view of all output
     @Published var pendingApproval: ApprovalRequest? = nil
     @Published var isStreaming: Bool = false
     @Published var taskCompleteSummary: String? = nil
     @Published var isReachable: Bool = false
+
+    // Multi-session
+    @Published var sessions: [AgentSession] = []
+    @Published var activeSessionIndex: Int = 0
+
+    var activeSession: AgentSession? {
+        guard sessions.indices.contains(activeSessionIndex) else { return nil }
+        return sessions[activeSessionIndex]
+    }
 
     private let bridge = WatchBridgeClient.shared
     private let maxLines = 200
@@ -19,7 +28,6 @@ class WatchViewState: ObservableObject {
     private var sseTask: URLSessionDataTask?
 
     private init() {
-        // Verify saved credentials by checking the bridge
         if bridge.isPaired {
             Task {
                 let reachable = await verifyBridge()
@@ -28,7 +36,6 @@ class WatchViewState: ObservableObject {
                         isPaired = true
                         startEventStream()
                     } else {
-                        // Bridge unreachable — clear stale credentials
                         bridge.unpair()
                         isPaired = false
                     }
@@ -51,15 +58,32 @@ class WatchViewState: ObservableObject {
         }
     }
 
-    // MARK: - Terminal
+    // MARK: - Terminal (legacy flat + per-session)
 
-    func appendLine(_ line: TerminalLine) {
+    func appendLine(_ line: TerminalLine, sessionId: String? = nil) {
         DispatchQueue.main.async {
+            // Append to legacy flat list
             self.terminalLines.append(line)
             if self.terminalLines.count > self.maxLines {
                 self.terminalLines.removeFirst(self.terminalLines.count - self.maxLines)
             }
+
+            // Append to the specific session
+            if let sid = sessionId, let idx = self.sessionIndex(for: sid) {
+                self.sessions[idx].terminalLines.append(line)
+                if self.sessions[idx].terminalLines.count > self.maxLines {
+                    self.sessions[idx].terminalLines.removeFirst(
+                        self.sessions[idx].terminalLines.count - self.maxLines
+                    )
+                }
+            }
         }
+    }
+
+    // MARK: - Session lookup
+
+    private func sessionIndex(for id: String) -> Int? {
+        sessions.firstIndex(where: { $0.id == id })
     }
 
     // MARK: - Event stream (SSE from bridge)
@@ -74,7 +98,7 @@ class WatchViewState: ObservableObject {
         if lastEventId > 0 {
             request.setValue("\(lastEventId)", forHTTPHeaderField: "Last-Event-ID")
         }
-        request.timeoutInterval = 300 // Long timeout for SSE
+        request.timeoutInterval = 300
 
         let session = URLSession(configuration: .default, delegate: SSEDelegate(owner: self), delegateQueue: nil)
         sseTask = session.dataTask(with: request)
@@ -96,7 +120,6 @@ class WatchViewState: ObservableObject {
     // MARK: - SSE parsing
 
     func handleSSEData(_ text: String) {
-        // Parse SSE format: "id: N\nevent: type\ndata: json\n\n"
         let blocks = text.components(separatedBy: "\n\n").filter { !$0.isEmpty }
 
         for block in blocks {
@@ -117,7 +140,6 @@ class WatchViewState: ObservableObject {
                         eventData! += "\n" + dataLine
                     }
                 } else if line.hasPrefix(":") {
-                    // Comment (heartbeat) — ignore
                     continue
                 }
             }
@@ -133,101 +155,26 @@ class WatchViewState: ObservableObject {
 
     private func processEvent(type: String, data: String) {
         guard let json = parseJSON(data) else { return }
+        let sessionId = json["sessionId"] as? String
 
         switch type {
         case "tool-output":
-            let toolName = json["tool_name"] as? String ?? "tool"
-            let toolInput = json["tool_input"] as? [String: Any] ?? [:]
-
-            switch toolName {
-            case "Bash":
-                let cmd = toolInput["command"] as? String ?? ""
-                appendLine(TerminalLine(text: "$ \(cmd)", type: .command))
-            case "Read":
-                let path = toolInput["file_path"] as? String ?? ""
-                appendLine(TerminalLine(text: "Read \((path as NSString).lastPathComponent)", type: .system))
-            case "Edit":
-                let path = toolInput["file_path"] as? String ?? ""
-                appendLine(TerminalLine(text: "Edit \((path as NSString).lastPathComponent)", type: .system))
-            case "Write":
-                let path = toolInput["file_path"] as? String ?? ""
-                appendLine(TerminalLine(text: "Write \((path as NSString).lastPathComponent)", type: .system))
-            case "Grep":
-                let pattern = toolInput["pattern"] as? String ?? ""
-                appendLine(TerminalLine(text: "grep \"\(pattern)\"", type: .command))
-            default:
-                appendLine(TerminalLine(text: "[\(toolName)]", type: .system))
-            }
-            isStreaming = true
+            handleToolOutput(json, sessionId: sessionId)
 
         case "permission-request":
-            let permissionId = json["permissionId"] as? String ?? UUID().uuidString
-            let toolName = json["tool_name"] as? String ?? "Unknown"
-            let toolInput = json["tool_input"] as? [String: Any] ?? [:]
-
-            var question: String? = nil
-            var desc = toolName
-            var options: [ApprovalRequest.OptionItem] = []
-
-            // Parse AskUserQuestion format
-            if let questions = toolInput["questions"] as? [[String: Any]],
-               let firstQ = questions.first {
-                question = firstQ["question"] as? String
-                desc = firstQ["header"] as? String ?? toolName
-
-                if let opts = firstQ["options"] as? [[String: Any]] {
-                    options = opts.map { opt in
-                        ApprovalRequest.OptionItem(
-                            label: opt["label"] as? String ?? "",
-                            description: opt["description"] as? String
-                        )
-                    }
-                }
-            }
-            // Fallback for Edit/Bash/etc permission prompts
-            else if let path = toolInput["file_path"] as? String {
-                desc = "\(toolName) \((path as NSString).lastPathComponent)"
-                options = [
-                    ApprovalRequest.OptionItem(label: "Yes"),
-                    ApprovalRequest.OptionItem(label: "Yes, allow all"),
-                    ApprovalRequest.OptionItem(label: "No"),
-                ]
-            } else if let cmd = toolInput["command"] as? String {
-                desc = "Run: \(String(cmd.prefix(50)))"
-                options = [
-                    ApprovalRequest.OptionItem(label: "Yes"),
-                    ApprovalRequest.OptionItem(label: "Yes, allow all"),
-                    ApprovalRequest.OptionItem(label: "No"),
-                ]
-            } else {
-                options = [
-                    ApprovalRequest.OptionItem(label: "Yes"),
-                    ApprovalRequest.OptionItem(label: "No"),
-                ]
-            }
-
-            pendingApproval = ApprovalRequest(
-                toolName: toolName, actionSummary: desc,
-                question: question, options: options
-            )
-            UserDefaults.standard.set(permissionId, forKey: "watch_pending_permission")
-            HapticManager.approvalNeeded()
+            handlePermissionRequest(json, sessionId: sessionId)
 
         case "stop":
-            appendLine(TerminalLine(text: "— stopped —", type: .system))
+            appendLine(TerminalLine(text: "— stopped —", type: .system), sessionId: sessionId)
             isStreaming = false
-
-        case "session":
-            let state = json["state"] as? String ?? ""
-            if state == "running" {
-                isStreaming = true
-            } else if state == "ended" {
-                isStreaming = false
-                appendLine(TerminalLine(text: "Session ended", type: .system))
+            if let sid = sessionId, let idx = sessionIndex(for: sid) {
+                sessions[idx].activity = .idle
             }
 
+        case "session":
+            handleSessionEvent(json, sessionId: sessionId)
+
         case "pty-output":
-            // Raw PTY output — show it
             if let text = json["text"] as? String {
                 let cleaned = text.replacingOccurrences(
                     of: "\\x1B\\[[0-9;]*[a-zA-Z]",
@@ -235,9 +182,161 @@ class WatchViewState: ObservableObject {
                     options: .regularExpression
                 ).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !cleaned.isEmpty {
-                    appendLine(TerminalLine(text: String(cleaned.prefix(80)), type: .output))
+                    appendLine(TerminalLine(text: String(cleaned.prefix(80)), type: .output), sessionId: sessionId)
                 }
             }
+
+        case "task-complete":
+            let summary = json["summary"] as? String
+            taskCompleteSummary = summary
+            HapticManager.taskComplete()
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Event handlers
+
+    private func handleToolOutput(_ json: [String: Any], sessionId: String?) {
+        let toolName = json["tool_name"] as? String ?? "tool"
+        let toolInput = json["tool_input"] as? [String: Any] ?? [:]
+        let source = json["source"] as? String ?? "claude"
+        let toolOutput = json["tool_output"] as? String
+        let prefix = source == "codex" ? "[codex] " : ""
+
+        switch toolName {
+        case "Bash":
+            let cmd = toolInput["command"] as? String ?? ""
+            appendLine(TerminalLine(text: "\(prefix)$ \(cmd)", type: .command), sessionId: sessionId)
+            if let output = toolOutput, !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                for line in output.components(separatedBy: "\n").prefix(5) {
+                    let cleaned = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty {
+                        appendLine(TerminalLine(text: cleaned, type: .output), sessionId: sessionId)
+                    }
+                }
+            }
+        case "Read":
+            let path = toolInput["file_path"] as? String ?? ""
+            appendLine(TerminalLine(text: "\(prefix)Read \((path as NSString).lastPathComponent)", type: .system), sessionId: sessionId)
+        case "Edit":
+            let path = toolInput["file_path"] as? String ?? ""
+            appendLine(TerminalLine(text: "\(prefix)Edit \((path as NSString).lastPathComponent)", type: .system), sessionId: sessionId)
+        case "Write":
+            let path = toolInput["file_path"] as? String ?? ""
+            appendLine(TerminalLine(text: "\(prefix)Write \((path as NSString).lastPathComponent)", type: .system), sessionId: sessionId)
+        case "Grep":
+            let pattern = toolInput["pattern"] as? String ?? ""
+            appendLine(TerminalLine(text: "\(prefix)grep \"\(pattern)\"", type: .command), sessionId: sessionId)
+        case "CodexMessage":
+            if let output = toolOutput {
+                appendLine(TerminalLine(text: "\(prefix)\(String(output.prefix(80)))", type: .output), sessionId: sessionId)
+            }
+        default:
+            appendLine(TerminalLine(text: "\(prefix)[\(toolName)]", type: .system), sessionId: sessionId)
+        }
+        isStreaming = true
+    }
+
+    private func handlePermissionRequest(_ json: [String: Any], sessionId: String?) {
+        let permissionId = json["permissionId"] as? String ?? UUID().uuidString
+        let toolName = json["tool_name"] as? String ?? "Unknown"
+        let toolInput = json["tool_input"] as? [String: Any] ?? [:]
+
+        var question: String? = nil
+        var desc = toolName
+        var options: [ApprovalRequest.OptionItem] = []
+
+        if let questions = toolInput["questions"] as? [[String: Any]],
+           let firstQ = questions.first {
+            question = firstQ["question"] as? String
+            desc = firstQ["header"] as? String ?? toolName
+            if let opts = firstQ["options"] as? [[String: Any]] {
+                options = opts.map { opt in
+                    ApprovalRequest.OptionItem(
+                        label: opt["label"] as? String ?? "",
+                        description: opt["description"] as? String
+                    )
+                }
+            }
+        } else if let path = toolInput["file_path"] as? String {
+            desc = "\(toolName) \((path as NSString).lastPathComponent)"
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
+        } else if let cmd = toolInput["command"] as? String {
+            desc = "Run: \(String(cmd.prefix(50)))"
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "Yes, allow all"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
+        } else {
+            options = [
+                ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "No"),
+            ]
+        }
+
+        let approval = ApprovalRequest(
+            toolName: toolName, actionSummary: desc,
+            question: question, options: options
+        )
+
+        pendingApproval = approval
+        UserDefaults.standard.set(permissionId, forKey: "watch_pending_permission")
+
+        // Also store on the specific session
+        if let sid = sessionId, let idx = sessionIndex(for: sid) {
+            sessions[idx].pendingApproval = approval
+            sessions[idx].activity = .waitingApproval
+            // Auto-switch to the session that needs approval
+            activeSessionIndex = idx
+        }
+
+        HapticManager.approvalNeeded()
+    }
+
+    private func handleSessionEvent(_ json: [String: Any], sessionId: String?) {
+        let state = json["state"] as? String ?? ""
+        let agent = json["agent"] as? String
+        let cwd = json["cwd"] as? String ?? ""
+        let folderName = json["folderName"] as? String ?? ""
+
+        switch state {
+        case "running":
+            isStreaming = true
+            if let sid = sessionId {
+                if let idx = sessionIndex(for: sid) {
+                    sessions[idx].activity = .running
+                } else {
+                    // New session appeared
+                    let agentType = AgentType(rawValue: agent ?? "claude") ?? .claude
+                    let newSession = AgentSession(
+                        id: sid, agent: agentType, cwd: cwd,
+                        folderName: folderName, activity: .running
+                    )
+                    sessions.append(newSession)
+                    // Auto-switch to the new session
+                    activeSessionIndex = sessions.count - 1
+                }
+            }
+
+        case "ended":
+            isStreaming = false
+            if let sid = sessionId, let idx = sessionIndex(for: sid) {
+                sessions[idx].activity = .ended
+                appendLine(TerminalLine(text: "Session ended", type: .system), sessionId: sid)
+            } else {
+                appendLine(TerminalLine(text: "Session ended", type: .system))
+            }
+
+        case "connected":
+            // Bridge-level: watch paired
+            break
 
         default:
             break
@@ -246,12 +345,16 @@ class WatchViewState: ObservableObject {
 
     // MARK: - Permission response
 
-    /// Respond with a specific option label (for AskUserQuestion)
     func respondToPermissionWithOption(_ optionLabel: String) {
         guard let permissionId = UserDefaults.standard.string(forKey: "watch_pending_permission"),
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
         pendingApproval = nil
+        // Clear from session
+        if let session = activeSession, let idx = sessionIndex(for: session.id) {
+            sessions[idx].pendingApproval = nil
+            sessions[idx].activity = .running
+        }
 
         let url = baseURL.appendingPathComponent("command")
         var request = URLRequest(url: url)
@@ -259,7 +362,6 @@ class WatchViewState: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        // For AskUserQuestion, we send "allow" with the selected option
         let body: [String: Any] = [
             "permissionId": permissionId,
             "decision": ["behavior": "allow"],
@@ -268,7 +370,7 @@ class WatchViewState: ObservableObject {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         URLSession.shared.dataTask(with: request).resume()
-        appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command))
+        appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command), sessionId: activeSession?.id)
         UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
     }
 
@@ -277,6 +379,10 @@ class WatchViewState: ObservableObject {
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
         pendingApproval = nil
+        if let session = activeSession, let idx = sessionIndex(for: session.id) {
+            sessions[idx].pendingApproval = nil
+            sessions[idx].activity = .running
+        }
 
         let url = baseURL.appendingPathComponent("command")
         var request = URLRequest(url: url)
@@ -294,15 +400,19 @@ class WatchViewState: ObservableObject {
             if let error { print("[WatchViewState] Permission response failed: \(error)") }
         }.resume()
 
-        appendLine(TerminalLine(text: approved ? "✓ Approved" : "✗ Denied", type: approved ? .output : .error))
+        appendLine(
+            TerminalLine(text: approved ? "✓ Approved" : "✗ Denied", type: approved ? .output : .error),
+            sessionId: activeSession?.id
+        )
         UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
     }
 
     // MARK: - Voice command (direct to bridge)
 
-    func sendVoiceCommand(_ text: String) {
-        appendLine(TerminalLine(text: "> \(text)", type: .command))
-        appendLine(TerminalLine(text: "", type: .thinking))
+    func sendVoiceCommand(_ text: String, sessionId: String? = nil) {
+        let sid = sessionId ?? activeSession?.id
+        appendLine(TerminalLine(text: "> \(text)", type: .command), sessionId: sid)
+        appendLine(TerminalLine(text: "", type: .thinking), sessionId: sid)
 
         guard let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
@@ -311,7 +421,10 @@ class WatchViewState: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try? JSONEncoder().encode(["command": text + "\n"])
+
+        var body: [String: Any] = ["command": text + "\n"]
+        if let sid { body["sessionId"] = sid }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         URLSession.shared.dataTask(with: request) { _, _, error in
             if let error { print("[WatchViewState] Command send failed: \(error)") }
@@ -326,6 +439,8 @@ class WatchViewState: ObservableObject {
         bridge.unpair()
         isPaired = false
         terminalLines = []
+        sessions = []
+        activeSessionIndex = 0
         pendingApproval = nil
         isStreaming = false
         sessionState = .disconnected
@@ -369,12 +484,10 @@ private class SSEDelegate: NSObject, URLSessionDataDelegate {
             print("[SSE] Connection lost: \(error.localizedDescription)")
         }
 
-        // Check if it was a 401 (already handled above)
         if let http = task.response as? HTTPURLResponse, http.statusCode == 401 {
             return
         }
 
-        // Reconnect after 3 seconds
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let owner = self?.owner, owner.isPaired else { return }
             owner.startEventStream()

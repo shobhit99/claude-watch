@@ -5,6 +5,7 @@ import SwiftUI
 /// Full-screen voice capture mode. Uses watchOS system dictation (TextField with dictation)
 /// since the Speech framework is not available on watchOS.
 struct VoiceInputView: View {
+    var sessionId: String? = nil
     @EnvironmentObject private var session: WatchViewState
     @Environment(\.dismiss) private var dismiss
 
@@ -96,7 +97,7 @@ struct VoiceInputView: View {
         guard !text.isEmpty else { return }
 
         HapticManager.commandSent()
-        session.sendVoiceCommand(text)
+        session.sendVoiceCommand(text, sessionId: sessionId)
         dismiss()
     }
 }

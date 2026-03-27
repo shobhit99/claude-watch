@@ -2,35 +2,13 @@ import http from "node:http";
 import crypto from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
+import path from "node:path";
 import { execSync } from "node:child_process";
 import { spawn as childSpawn } from "node:child_process";
 import { Bonjour } from "bonjour-service";
 
-// Resolve the full path to the claude binary.
-// node-pty uses posix_spawnp which may not inherit the interactive shell PATH.
-function findClaudeBinary() {
-  // Check common install locations directly — avoids shell session noise
-  const candidates = [
-    `${os.homedir()}/.local/bin/claude`,
-    "/usr/local/bin/claude",
-    "/opt/homebrew/bin/claude",
-  ];
-  for (const c of candidates) {
-    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* continue */ }
-  }
-  // Last resort: try which (without interactive shell flags)
-  try {
-    return execSync("which claude 2>/dev/null", { encoding: "utf-8" }).trim();
-  } catch { /* fall through */ }
-  throw new Error(
-    "Could not find the 'claude' binary. Ensure Claude Code is installed and on your PATH."
-  );
-}
-
-const CLAUDE_BIN = findClaudeBinary();
-
 // ---------------------------------------------------------------------------
-// Logging
+// Logging (must be defined before use)
 // ---------------------------------------------------------------------------
 
 function log(level, msg, ...args) {
@@ -44,18 +22,53 @@ function log(level, msg, ...args) {
 }
 
 // ---------------------------------------------------------------------------
+// Binary discovery
+// ---------------------------------------------------------------------------
+
+function findBinary(name, candidates) {
+  for (const c of candidates) {
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* continue */ }
+  }
+  try {
+    return execSync(`which ${name} 2>/dev/null`, { encoding: "utf-8" }).trim();
+  } catch { /* fall through */ }
+  return null;
+}
+
+const CLAUDE_BIN = findBinary("claude", [
+  `${os.homedir()}/.local/bin/claude`,
+  "/usr/local/bin/claude",
+  "/opt/homebrew/bin/claude",
+]);
+
+const CODEX_BIN = findBinary("codex", [
+  `${os.homedir()}/.local/bin/codex`,
+  "/usr/local/bin/codex",
+  "/opt/homebrew/bin/codex",
+]);
+
+if (!CLAUDE_BIN) {
+  log("warn", "Could not find 'claude' binary — Claude sessions will not be available.");
+}
+if (CODEX_BIN) {
+  log("info", `Codex binary found: ${CODEX_BIN}`);
+} else {
+  log("info", "Codex not found — Codex sessions will not be available.");
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const PORT_RANGE_START = 7860;
 const PORT_RANGE_END = 7869;
-const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
-const SESSION_ID = crypto.randomUUID();
+const BRIDGE_ID = crypto.randomUUID();
 
 // ---------------------------------------------------------------------------
 // State
@@ -65,30 +78,32 @@ let sessionToken = null;
 let pairingCode = null;
 let pairingCodeExpiresAt = 0;
 
-// Rate limiting (simple in-memory)
+// Rate limiting
 let rateLimitAttempts = 0;
 let rateLimitWindowStart = Date.now();
 
-// Session state: "idle" | "running" | "ended" | "connected"
-let sessionState = "idle";
+// Bridge-level state: "idle" | "connected"
+let bridgeState = "idle";
 
-// SSE --
+// Multi-session: each entry is a session slot
+// { id, agent, cwd, folderName, ptyProcess, state, createdAt }
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number}>} */
+const sessions = new Map();
+
+// SSE
 let sseEventId = 0;
 /** @type {Array<{id: number, event: string, data: string}>} */
 const sseBuffer = [];
 /** @type {Set<http.ServerResponse>} */
 const sseClients = new Set();
 
-// Permission flow --
-/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>}>} */
+// Permission flow
+/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>, sessionId: string | null}>} */
 const pendingPermissions = new Map();
-/** @type {Map<string, Array>} Stores original permission_suggestions per permissionId */
+/** @type {Map<string, Array>} */
 const pendingPermissionBodies = new Map();
 
-// PTY --
-let ptyProcess = null;
-
-// Bonjour --
+// Bonjour
 let bonjourInstance = null;
 let bonjourService = null;
 
@@ -97,7 +112,6 @@ let bonjourService = null;
 // ---------------------------------------------------------------------------
 
 function generatePairingCode() {
-  // 6-digit zero-padded random code
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   pairingCode = code;
   pairingCodeExpiresAt = Date.now() + PAIRING_CODE_TTL_MS;
@@ -106,7 +120,7 @@ function generatePairingCode() {
 }
 
 function generateSessionToken() {
-  const token = crypto.randomBytes(32).toString("hex"); // 256-bit
+  const token = crypto.randomBytes(32).toString("hex");
   sessionToken = token;
   return token;
 }
@@ -114,7 +128,6 @@ function generateSessionToken() {
 function isRateLimited() {
   const now = Date.now();
   if (now - rateLimitWindowStart > RATE_LIMIT_WINDOW_MS) {
-    // Reset window
     rateLimitAttempts = 0;
     rateLimitWindowStart = now;
   }
@@ -162,13 +175,36 @@ function readBody(req) {
   });
 }
 
+function availableAgentsList() {
+  const agents = [];
+  if (CLAUDE_BIN) agents.push("claude");
+  if (CODEX_BIN) agents.push("codex");
+  return agents;
+}
+
 // ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
 
-function pushSseEvent(event, data) {
+function pushSseEvent(event, data, sessionId = null) {
   sseEventId++;
-  const entry = { id: sseEventId, event, data: typeof data === "string" ? data : JSON.stringify(data) };
+
+  // Inject sessionId into the data payload
+  let payload;
+  if (typeof data === "string") {
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      payload = { raw: data };
+    }
+  } else {
+    payload = { ...data };
+  }
+  if (sessionId !== null) {
+    payload.sessionId = sessionId;
+  }
+
+  const entry = { id: sseEventId, event, data: JSON.stringify(payload) };
 
   // Ring buffer
   if (sseBuffer.length >= SSE_BUFFER_SIZE) {
@@ -190,7 +226,6 @@ function pushSseEvent(event, data) {
 function formatSseMessage(entry) {
   let msg = `id: ${entry.id}\n`;
   msg += `event: ${entry.event}\n`;
-  // Multi-line data support
   for (const line of entry.data.split("\n")) {
     msg += `data: ${line}\n`;
   }
@@ -199,20 +234,27 @@ function formatSseMessage(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// PTY management
+// Multi-session PTY management
 // ---------------------------------------------------------------------------
 
-function spawnClaude(cwd) {
+function spawnSession(agent, cwd) {
+  const bin = agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
+  if (!bin) {
+    const msg = `Cannot spawn ${agent}: binary not found`;
+    log("error", msg);
+    pushSseEvent("error", { error: msg });
+    return null;
+  }
+
+  const sessionId = crypto.randomUUID();
+  const folderName = path.basename(cwd) || cwd;
   const cols = parseInt(process.env.COLUMNS, 10) || 120;
   const rows = parseInt(process.env.LINES, 10) || 40;
 
-  log("info", `Spawning claude in PTY via script (cwd: ${cwd})`);
-  log("info", `Using claude binary: ${CLAUDE_BIN}`);
+  log("info", `Spawning ${agent} session ${sessionId} in PTY (cwd: ${cwd})`);
+  log("info", `Using binary: ${bin}`);
 
-  // Use macOS `script` command to allocate a PTY, since node-pty's posix_spawnp
-  // can be blocked by sandboxed environments. `script -q /dev/null` gives us a
-  // real PTY while child_process.spawn handles the process lifecycle.
-  ptyProcess = childSpawn("script", ["-q", "/dev/null", CLAUDE_BIN], {
+  const proc = childSpawn("script", ["-q", "/dev/null", bin], {
     cwd,
     env: {
       ...process.env,
@@ -223,48 +265,87 @@ function spawnClaude(cwd) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  sessionState = "running";
-  pushSseEvent("session", { state: "running" });
+  const slot = {
+    id: sessionId,
+    agent,
+    cwd,
+    folderName,
+    ptyProcess: proc,
+    state: "running",
+    createdAt: Date.now(),
+  };
+  sessions.set(sessionId, slot);
 
-  ptyProcess.stdout.on("data", (data) => {
-    pushSseEvent("pty-output", { text: data.toString() });
+  pushSseEvent("session", { state: "running", agent, cwd, folderName }, sessionId);
+
+  proc.stdout.on("data", (data) => {
+    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
-  ptyProcess.stderr.on("data", (data) => {
-    pushSseEvent("pty-output", { text: data.toString() });
+  proc.stderr.on("data", (data) => {
+    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
-  ptyProcess.on("close", (exitCode, signal) => {
-    log("info", `PTY exited: code=${exitCode} signal=${signal}`);
-    sessionState = "ended";
-    pushSseEvent("session", { state: "ended", exitCode, signal });
-    ptyProcess = null;
+  proc.on("close", (exitCode, signal) => {
+    log("info", `Session ${sessionId} (${agent}) PTY exited: code=${exitCode} signal=${signal}`);
+    slot.state = "ended";
+    slot.ptyProcess = null;
+    pushSseEvent("session", { state: "ended", exitCode, signal, agent, folderName }, sessionId);
   });
 
-  ptyProcess.on("error", (err) => {
-    log("error", `PTY spawn error: ${err.message}`);
-    sessionState = "ended";
-    pushSseEvent("session", { state: "ended", error: err.message });
-    ptyProcess = null;
+  proc.on("error", (err) => {
+    log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
+    slot.state = "ended";
+    slot.ptyProcess = null;
+    pushSseEvent("session", { state: "ended", error: err.message, agent, folderName }, sessionId);
   });
 
-  log("info", "Claude PTY process started, pid:", ptyProcess.pid);
+  log("info", `${agent} session ${sessionId} started (${folderName}), pid: ${proc.pid}`);
+  return sessionId;
 }
 
-function writeToPty(text) {
-  if (!ptyProcess) {
-    // Auto-spawn Claude when the first command arrives
-    const cwd = process.argv[2] || process.env.HOME || process.cwd();
-    spawnClaude(cwd);
-    // Wait briefly for the PTY to initialize
-    setTimeout(() => {
-      if (ptyProcess) {
-        ptyProcess.stdin.write(text);
-      }
-    }, 500);
-    return;
+function killSession(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (!slot) return false;
+  if (slot.ptyProcess) {
+    try { slot.ptyProcess.kill(); } catch { /* ignore */ }
   }
-  ptyProcess.stdin.write(text);
+  slot.state = "ended";
+  slot.ptyProcess = null;
+  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, killed: true }, sessionId);
+  log("info", `Session ${sessionId} killed`);
+  return true;
+}
+
+function findSessionByCwd(cwd) {
+  if (!cwd) return null;
+  for (const [, slot] of sessions) {
+    if (slot.cwd === cwd && slot.state === "running") return slot;
+  }
+  return null;
+}
+
+function findMostRecentActiveSession() {
+  let best = null;
+  for (const [, slot] of sessions) {
+    if (slot.state === "running" && slot.ptyProcess) {
+      if (!best || slot.createdAt > best.createdAt) {
+        best = slot;
+      }
+    }
+  }
+  return best;
+}
+
+function getSessionsSnapshot() {
+  return Array.from(sessions.values()).map((s) => ({
+    id: s.id,
+    agent: s.agent,
+    cwd: s.cwd,
+    folderName: s.folderName,
+    state: s.state,
+    createdAt: s.createdAt,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +401,6 @@ async function handlePair(req, res) {
   }
 
   if (Date.now() > pairingCodeExpiresAt) {
-    // Regenerate an expired code
     generatePairingCode();
     return jsonResponse(res, 401, { error: "Pairing code expired. A new code has been generated." });
   }
@@ -329,15 +409,21 @@ async function handlePair(req, res) {
     return jsonResponse(res, 401, { error: "Invalid pairing code" });
   }
 
-  // Success — generate token, invalidate code
+  // Success
   const token = generateSessionToken();
   pairingCode = null;
   pairingCodeExpiresAt = 0;
-  sessionState = "connected";
+  bridgeState = "connected";
   pushSseEvent("session", { state: "connected" });
 
   log("info", "Watch paired successfully");
-  return jsonResponse(res, 200, { token, sessionId: SESSION_ID });
+  return jsonResponse(res, 200, {
+    token,
+    bridgeId: BRIDGE_ID,
+    sessionId: BRIDGE_ID, // backward compat
+    availableAgents: availableAgentsList(),
+    sessions: getSessionsSnapshot(),
+  });
 }
 
 async function handleCommand(req, res) {
@@ -355,14 +441,34 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  const { command, permissionId, decision, allowAll } = body;
+  const { command, permissionId, decision, allowAll, agent, sessionId, spawn: spawnRequest, kill: killRequest } = body;
 
-  // Handle permission response from watch/phone
+  // --- Spawn a new session ---
+  if (spawnRequest) {
+    const validAgents = ["claude", "codex"];
+    if (!validAgents.includes(spawnRequest)) {
+      return jsonResponse(res, 400, { error: `Invalid agent: ${spawnRequest}. Use: ${validAgents.join(", ")}` });
+    }
+    const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const newId = spawnSession(spawnRequest, cwd);
+    if (!newId) {
+      return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });
+    }
+    return jsonResponse(res, 200, { ok: true, sessionId: newId, agent: spawnRequest });
+  }
+
+  // --- Kill a session ---
+  if (killRequest && sessionId) {
+    const killed = killSession(sessionId);
+    if (!killed) {
+      return jsonResponse(res, 404, { error: "No session with that ID" });
+    }
+    return jsonResponse(res, 200, { ok: true });
+  }
+
+  // --- Permission response ---
   if (permissionId && decision) {
-    // If "allow all" was chosen, attach the permission_suggestions from the
-    // original request so Claude Code can auto-add the permission rule.
     if (allowAll && decision.behavior === "allow") {
-      // Store the original body's permission_suggestions alongside the decision
       decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
     }
     pendingPermissionBodies.delete(permissionId);
@@ -375,21 +481,49 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 200, { ok: true });
   }
 
-  // Handle PTY command injection
+  // --- PTY command injection ---
   if (command !== undefined) {
-    if (!ptyProcess) {
-      return jsonResponse(res, 409, { error: "No active PTY session" });
+    // Find the target session
+    let targetSession = null;
+
+    if (sessionId) {
+      targetSession = sessions.get(sessionId);
+      if (!targetSession || !targetSession.ptyProcess) {
+        return jsonResponse(res, 404, { error: "No active session with that ID" });
+      }
+    } else {
+      // Backward compat: route to the most recent active session
+      targetSession = findMostRecentActiveSession();
     }
+
+    if (!targetSession) {
+      // Auto-spawn a new session
+      const requestedAgent = agent || "claude";
+      const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+      const newId = spawnSession(requestedAgent, cwd);
+      if (!newId) {
+        return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });
+      }
+      const slot = sessions.get(newId);
+      setTimeout(() => {
+        if (slot && slot.ptyProcess) {
+          slot.ptyProcess.stdin.write(command);
+          log("info", `Command injected into new ${requestedAgent} session ${newId} (${command.length} chars)`);
+        }
+      }, 500);
+      return jsonResponse(res, 200, { ok: true, sessionId: newId, agent: requestedAgent, spawned: true });
+    }
+
     try {
-      writeToPty(command);
-      log("info", `Command injected into PTY (${command.length} chars)`);
-      return jsonResponse(res, 200, { ok: true });
+      targetSession.ptyProcess.stdin.write(command);
+      log("info", `Command injected into session ${targetSession.id} (${command.length} chars)`);
+      return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent });
     } catch (err) {
       return jsonResponse(res, 500, { error: err.message });
     }
   }
 
-  return jsonResponse(res, 400, { error: "Missing 'command' or 'permissionId'+'decision'" });
+  return jsonResponse(res, 400, { error: "Missing 'command', 'spawn', 'kill', or 'permissionId'+'decision'" });
 }
 
 function handleEvents(req, res) {
@@ -420,11 +554,9 @@ function handleEvents(req, res) {
     }
   }
 
-  // Register client
   sseClients.add(res);
   log("info", `SSE client connected (total: ${sseClients.size})`);
 
-  // Heartbeat
   const heartbeat = setInterval(() => {
     try {
       res.write(":heartbeat\n\n");
@@ -441,6 +573,44 @@ function handleEvents(req, res) {
   });
 }
 
+// --- Hook handlers ---
+// Hooks come from Claude Code instances. We match by cwd to find the session.
+
+function resolveHookSession(body) {
+  const cwd = body.session_cwd || body.cwd || null;
+  const source = body.source || "claude";
+
+  // Try exact cwd match first
+  const match = findSessionByCwd(cwd);
+  if (match) return match.id;
+
+  // Fallback: if exactly one running session, use it
+  const active = findMostRecentActiveSession();
+  if (active) return active.id;
+
+  // No session exists — auto-create one for this external Claude/Codex instance
+  const agent = source === "codex" ? "codex" : "claude";
+  const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+  const folderName = path.basename(resolvedCwd) || resolvedCwd;
+  const sessionId = crypto.randomUUID();
+
+  const slot = {
+    id: sessionId,
+    agent,
+    cwd: resolvedCwd,
+    folderName,
+    ptyProcess: null, // External process — no PTY owned by bridge
+    state: "running",
+    createdAt: Date.now(),
+  };
+  sessions.set(sessionId, slot);
+
+  log("info", `Auto-created session ${sessionId} for external ${agent} (${folderName})`);
+  pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, sessionId);
+
+  return sessionId;
+}
+
 async function handleHookToolOutput(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
@@ -450,8 +620,10 @@ async function handleHookToolOutput(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  log("info", "Hook: PostToolUse received", body.tool_name || "");
-  pushSseEvent("tool-output", body);
+  const sid = resolveHookSession(body);
+  const source = body.source || "claude";
+  log("info", `Hook: ${source === "codex" ? "Codex" : "PostToolUse"} received [${source}]${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+  pushSseEvent("tool-output", { ...body, source }, sid);
   return jsonResponse(res, 200, { ok: true });
 }
 
@@ -464,19 +636,16 @@ async function handleHookPermission(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
+  const sid = resolveHookSession(body);
   const permissionId = crypto.randomUUID();
-  log("info", `Hook: PermissionRequest received (id: ${permissionId})`, body.tool_name || "");
-  log("info", `Hook: PermissionRequest full body:`, JSON.stringify(body, null, 2));
+  log("info", `Hook: PermissionRequest received (id: ${permissionId})${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
 
-  // Store permission_suggestions for "allow all" flow
   if (body.permission_suggestions) {
     pendingPermissionBodies.set(permissionId, body.permission_suggestions);
   }
 
-  // Push to SSE so watch/phone can see and respond
-  pushSseEvent("permission-request", { permissionId, ...body });
+  pushSseEvent("permission-request", { permissionId, ...body }, sid);
 
-  // Block until watch responds or timeout
   const decision = await waitForPermission(permissionId);
 
   log("info", `Hook: PermissionRequest resolved (id: ${permissionId}): ${decision.behavior}`);
@@ -488,7 +657,6 @@ async function handleHookPermission(req, res) {
     },
   };
 
-  // If "allow all", include updatedPermissions so Claude adds the rule
   if (decision.updatedPermissions && decision.updatedPermissions.length > 0) {
     hookResponse.hookSpecificOutput.decision.updatedPermissions = decision.updatedPermissions;
   }
@@ -509,8 +677,9 @@ async function handleHookStop(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  log("info", "Hook: Stop received");
-  pushSseEvent("stop", body);
+  const sid = resolveHookSession(body);
+  log("info", `Hook: Stop received${sid ? ` session=${sid}` : ""}`);
+  pushSseEvent("stop", body, sid);
   return jsonResponse(res, 200, { ok: true });
 }
 
@@ -523,8 +692,9 @@ async function handleHookTaskComplete(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  log("info", "Hook: TaskCompleted received");
-  pushSseEvent("task-complete", body);
+  const sid = resolveHookSession(body);
+  log("info", `Hook: TaskCompleted received${sid ? ` session=${sid}` : ""}`);
+  pushSseEvent("task-complete", body, sid);
   return jsonResponse(res, 200, { ok: true });
 }
 
@@ -537,19 +707,25 @@ async function handleHookError(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  log("info", "Hook: Error received", body.error || "");
-  pushSseEvent("error", body);
+  const sid = resolveHookSession(body);
+  log("info", `Hook: Error received${sid ? ` session=${sid}` : ""}`, body.error || "");
+  pushSseEvent("error", body, sid);
   return jsonResponse(res, 200, { ok: true });
 }
 
 function handleStatus(_req, res) {
   return jsonResponse(res, 200, {
-    state: sessionState,
-    sessionId: SESSION_ID,
-    hasPty: ptyProcess !== null,
+    bridgeId: BRIDGE_ID,
+    sessionId: BRIDGE_ID, // backward compat
+    state: bridgeState,
+    availableAgents: availableAgentsList(),
+    sessions: getSessionsSnapshot(),
     sseClients: sseClients.size,
     pendingPermissions: pendingPermissions.size,
     eventBufferSize: sseBuffer.length,
+    // Backward compat: expose the most recent active session's info
+    hasPty: findMostRecentActiveSession() !== null,
+    activeAgent: findMostRecentActiveSession()?.agent || null,
   });
 }
 
@@ -589,7 +765,7 @@ async function onRequest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// Server startup — find available port
+// Server startup
 // ---------------------------------------------------------------------------
 
 function tryListen(server, port) {
@@ -626,10 +802,9 @@ async function startServer() {
 
   log("info", `Bridge server listening on 0.0.0.0:${boundPort}`);
 
-  // Generate initial pairing code
   const code = generatePairingCode();
 
-  // Advertise via Bonjour/mDNS
+  // Bonjour
   bonjourInstance = new Bonjour();
   bonjourService = bonjourInstance.publish({
     name: `Claude Watch Bridge (${os.hostname()})`,
@@ -637,22 +812,24 @@ async function startServer() {
     protocol: "tcp",
     port: boundPort,
     txt: {
-      version: "1",
-      sessionId: SESSION_ID,
+      version: "2",
+      bridgeId: BRIDGE_ID,
+      sessionId: BRIDGE_ID, // backward compat
       machineName: os.hostname(),
     },
   });
 
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
 
-  // PTY is spawned on-demand when the first command arrives, not on startup.
-  // This allows the bridge to start independently of any Claude session.
-  log("info", "Bridge ready. PTY will spawn when first command is received.");
+  const agents = [];
+  if (CLAUDE_BIN) agents.push("Claude");
+  if (CODEX_BIN) agents.push("Codex");
+  log("info", `Bridge ready. Available agents: ${agents.join(", ") || "none"}. Sessions spawn on demand.`);
 
-  // Get LAN IP for watch pairing
+  // Get LAN IP
   const interfaces = os.networkInterfaces();
   let lanIP = "127.0.0.1";
-  for (const [name, addrs] of Object.entries(interfaces)) {
+  for (const [, addrs] of Object.entries(interfaces)) {
     for (const addr of addrs) {
       if (addr.family === "IPv4" && !addr.internal) {
         lanIP = addr.address;
@@ -662,7 +839,7 @@ async function startServer() {
     if (lanIP !== "127.0.0.1") break;
   }
 
-  // Print pairing info prominently
+  const agentLine = agents.length ? agents.join(" + ") : "none";
   console.log("");
   console.log("╔═══════════════════════════════════════╗");
   console.log("║        CLAUDE WATCH BRIDGE            ║");
@@ -670,12 +847,11 @@ async function startServer() {
   console.log(`║  Pairing Code:  ${code}                ║`);
   console.log(`║  IP Address:    ${lanIP.padEnd(20)}║`);
   console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
+  console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
   console.log("╚═══════════════════════════════════════╝");
   console.log("");
 
-  // ---------------------------------------------------------------------------
-  // Graceful shutdown
-  // ---------------------------------------------------------------------------
+  // --- Graceful shutdown ---
 
   let shuttingDown = false;
 
@@ -684,47 +860,38 @@ async function startServer() {
     shuttingDown = true;
     log("info", `Received ${signal}, shutting down gracefully...`);
 
-    // Close SSE clients
     for (const client of sseClients) {
-      try {
-        client.end();
-      } catch { /* ignore */ }
+      try { client.end(); } catch { /* ignore */ }
     }
     sseClients.clear();
 
-    // Kill PTY
-    if (ptyProcess) {
-      try {
-        ptyProcess.kill();
-      } catch { /* ignore */ }
+    // Kill all session PTYs
+    for (const [id, slot] of sessions) {
+      if (slot.ptyProcess) {
+        try { slot.ptyProcess.kill(); } catch { /* ignore */ }
+        log("info", `Killed session ${id} (${slot.agent})`);
+      }
     }
+    sessions.clear();
 
-    // Unpublish Bonjour
     if (bonjourService) {
-      try {
-        bonjourInstance.unpublishAll();
-      } catch { /* ignore */ }
+      try { bonjourInstance.unpublishAll(); } catch { /* ignore */ }
     }
     if (bonjourInstance) {
-      try {
-        bonjourInstance.destroy();
-      } catch { /* ignore */ }
+      try { bonjourInstance.destroy(); } catch { /* ignore */ }
     }
 
-    // Resolve any pending permissions with deny
     for (const [id, pending] of pendingPermissions) {
       clearTimeout(pending.timer);
       pending.resolve({ behavior: "deny", reason: "Server shutting down" });
     }
     pendingPermissions.clear();
 
-    // Close HTTP server
     server.close(() => {
       log("info", "Server closed");
       process.exit(0);
     });
 
-    // Force exit after 5 seconds
     setTimeout(() => {
       log("warn", "Forced exit after timeout");
       process.exit(1);

@@ -111,10 +111,31 @@ final class BridgeClient {
 
     // MARK: - Commands
 
-    /// Sends a text command to the bridge PTY.
-    func sendCommand(text: String) async throws {
-        let body = ["command": text]
-        try await authenticatedPost(path: "command", body: body)
+    /// Sends a text command to a specific session's PTY.
+    func sendCommand(text: String, sessionId: String? = nil) async throws {
+        var body: [String: Any] = ["command": text]
+        if let sid = sessionId { body["sessionId"] = sid }
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    /// Spawns a new agent session.
+    func spawnSession(agent: String, cwd: String? = nil) async throws -> String {
+        var body: [String: Any] = ["spawn": agent]
+        if let cwd { body["cwd"] = cwd }
+        guard let baseURL, let token else { throw BridgeError.networkError }
+        let url = baseURL.appendingPathComponent("command")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await performRequest(request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw BridgeError.serverError("Failed to spawn session")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["sessionId"] as? String ?? ""
     }
 
     /// Responds to an approval request.
@@ -212,7 +233,9 @@ final class BridgeClient {
 
     private struct PairResponse: Decodable {
         let token: String
-        let sessionId: String
+        let sessionId: String?
+        let bridgeId: String?
+        let availableAgents: [String]?
     }
 
     private struct ErrorResponse: Decodable {
@@ -221,10 +244,22 @@ final class BridgeClient {
 
     struct BridgeStatus: Decodable {
         let state: String
-        let sessionId: String
+        let sessionId: String?
+        let bridgeId: String?
         let hasPty: Bool
+        let activeAgent: String?
+        let availableAgents: [String]?
+        let sessions: [BridgeSessionInfo]?
         let sseClients: Int
         let pendingPermissions: Int
         let eventBufferSize: Int
+    }
+
+    struct BridgeSessionInfo: Decodable {
+        let id: String
+        let agent: String
+        let cwd: String
+        let folderName: String
+        let state: String
     }
 }

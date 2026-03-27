@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SessionView: View {
+    let agentSession: AgentSession
     @EnvironmentObject private var session: WatchViewState
 
     @State private var showVoiceInput = false
@@ -10,12 +11,13 @@ struct SessionView: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             VStack(spacing: 0) {
-                // Top bar
+                // Top bar — agent icon + folder name
                 HStack(spacing: 4) {
-                    ClaudeMascot(size: 14)
-                    Text("Claude")
+                    AgentIcon(agent: agentSession.agent, size: 14)
+                    Text(agentSession.folderName.isEmpty ? agentSession.agent.rawValue.capitalized : agentSession.folderName)
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(Theme.Text.primary)
+                        .lineLimit(1)
                     Spacer()
                     Circle()
                         .fill(statusColor)
@@ -24,11 +26,10 @@ struct SessionView: View {
                 .padding(.horizontal, 4)
                 .padding(.bottom, 2)
 
-                // Terminal — use regular VStack (not Lazy) to avoid blank flashes
+                // Terminal
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         VStack(alignment: .leading, spacing: 1) {
-                            // Only show last 30 lines to keep performance stable
                             ForEach(visibleLines) { line in
                                 terminalLine(line)
                                     .id(line.id)
@@ -42,13 +43,12 @@ struct SessionView: View {
                                     .id("cursor")
                             }
 
-                            // Spacer for FAB
                             Spacer().frame(height: 40)
                         }
                         .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .onChange(of: session.terminalLines.count) { _ in
+                    .onChange(of: agentSession.terminalLines.count) { _ in
                         withAnimation(.easeOut(duration: 0.1)) {
                             if isThinking {
                                 proxy.scrollTo("cursor", anchor: .bottom)
@@ -82,16 +82,15 @@ struct SessionView: View {
             ApprovalView(request: request)
         }
         .fullScreenCover(isPresented: $showVoiceInput) {
-            VoiceInputView()
+            VoiceInputView(sessionId: agentSession.id)
         }
     }
 
-    // Only render last 30 lines, skip empty/thinking lines
     private var visibleLines: [TerminalLine] {
-        session.terminalLines
+        agentSession.terminalLines
             .filter { !$0.text.isEmpty || $0.type == .thinking }
             .suffix(30)
-            .map { $0 } // convert Slice to Array
+            .map { $0 }
     }
 
     @ViewBuilder
@@ -105,15 +104,15 @@ struct SessionView: View {
     }
 
     private var isThinking: Bool {
-        session.terminalLines.last?.type == .thinking
+        agentSession.terminalLines.last?.type == .thinking
     }
 
     private var statusColor: Color {
-        switch session.sessionState.connection {
-        case .connected: return Theme.Accent.success
-        case .connecting: return Theme.Text.secondary
-        case .disconnected: return Theme.Accent.error
-        case .iPhoneUnreachable: return Theme.Accent.approval
+        switch agentSession.activity {
+        case .running: return Theme.Accent.success
+        case .waitingApproval: return Theme.Accent.approval
+        case .ended: return Theme.Accent.error
+        case .idle: return Theme.Text.secondary
         }
     }
 
@@ -136,9 +135,4 @@ struct PulseModifier: ViewModifier {
             .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: isPulsing)
             .onAppear { isPulsing = true }
     }
-}
-
-#Preview {
-    SessionView()
-        .environmentObject(WatchViewState.shared)
 }

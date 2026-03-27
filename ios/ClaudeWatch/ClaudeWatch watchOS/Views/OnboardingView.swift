@@ -58,9 +58,13 @@ struct OnboardingView: View {
 
             } else {
                 // Not found — IP entry right away
-                Text("Mac IP address")
+                Text("Enter Mac IP")
                     .font(.system(size: 11))
                     .foregroundColor(Theme.Text.secondary)
+
+                Text("Wi-Fi not required — routes via iPhone")
+                    .font(.system(size: 9))
+                    .foregroundColor(Theme.Text.dimmed)
 
                 TextField("192.168.1.x", text: $ipAddress)
                     .font(.system(size: 16, weight: .bold, design: .monospaced))

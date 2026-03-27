@@ -16,6 +16,7 @@ enum WatchMessage: Codable {
     case approvalRequestMessage(ApprovalRequest)
     case sessionStateUpdate(SessionState)
     case connectionStatus(ConnectionStatusMessage)
+    case sessionsUpdate(SessionsUpdate)
 
     // MARK: - Payload Types
 
@@ -65,6 +66,16 @@ enum WatchMessage: Codable {
         }
     }
 
+    struct SessionsUpdate: Codable {
+        let sessions: [AgentSession]
+        let timestamp: Date
+
+        init(sessions: [AgentSession]) {
+            self.sessions = sessions
+            self.timestamp = Date()
+        }
+    }
+
     // MARK: - Dictionary keys
 
     private static let typeKey = "messageType"
@@ -78,6 +89,7 @@ enum WatchMessage: Codable {
         case .approvalRequestMessage: return "approvalRequestMessage"
         case .sessionStateUpdate:     return "sessionStateUpdate"
         case .connectionStatus:       return "connectionStatus"
+        case .sessionsUpdate:         return "sessionsUpdate"
         }
     }
 
@@ -128,6 +140,8 @@ enum WatchMessage: Codable {
             try container.encode(state, forKey: .payload)
         case .connectionStatus(let status):
             try container.encode(status, forKey: .payload)
+        case .sessionsUpdate(let update):
+            try container.encode(update, forKey: .payload)
         }
     }
 
@@ -148,6 +162,8 @@ enum WatchMessage: Codable {
             self = .sessionStateUpdate(try container.decode(SessionState.self, forKey: .payload))
         case "connectionStatus":
             self = .connectionStatus(try container.decode(ConnectionStatusMessage.self, forKey: .payload))
+        case "sessionsUpdate":
+            self = .sessionsUpdate(try container.decode(SessionsUpdate.self, forKey: .payload))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .messageType,

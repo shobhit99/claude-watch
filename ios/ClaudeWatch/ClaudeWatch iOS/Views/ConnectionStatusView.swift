@@ -22,6 +22,11 @@ struct ConnectionStatusView: View {
                     }
 
                     statusCard
+
+                    if !relayService.sessions.isEmpty {
+                        sessionsSection
+                    }
+
                     terminalOutput
                     Spacer()
                     if showBackgroundBanner {
@@ -132,6 +137,42 @@ struct ConnectionStatusView: View {
         .padding(16)
         .background(Color.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - Sessions
+
+    private var sessionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Sessions")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.subtleText)
+
+            ForEach(relayService.sessions) { session in
+                HStack(spacing: 10) {
+                    AgentIcon(agent: session.agent, size: 20)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(session.folderName.isEmpty ? session.agent.rawValue.capitalized : session.folderName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                        Text(session.cwd)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Color.subtleText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+
+                    Circle()
+                        .fill(session.activity == .running ? Color.statusGreen : Color.subtleText)
+                        .frame(width: 8, height: 8)
+                }
+                .padding(12)
+                .background(Color.cardBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+        }
     }
 
     // MARK: - Permission prompt
