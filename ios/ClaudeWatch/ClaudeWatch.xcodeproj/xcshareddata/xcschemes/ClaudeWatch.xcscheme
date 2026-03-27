@@ -15,7 +15,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C84EB2FEED987DB13A41B90F"
-               BuildableName = "Claude Watch.app"
+               BuildableName = "Agent Watch.app"
                BlueprintName = "ClaudeWatch"
                ReferencedContainer = "container:ClaudeWatch.xcodeproj">
             </BuildableReference>
@@ -29,7 +29,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A9E7C489C7D6CA4629614B5E"
-               BuildableName = "Claude Watch.app"
+               BuildableName = "Agent Watch.app"
                BlueprintName = "ClaudeWatchWatch"
                ReferencedContainer = "container:ClaudeWatch.xcodeproj">
             </BuildableReference>
@@ -45,7 +45,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C84EB2FEED987DB13A41B90F"
-            BuildableName = "Claude Watch.app"
+            BuildableName = "Agent Watch.app"
             BlueprintName = "ClaudeWatch"
             ReferencedContainer = "container:ClaudeWatch.xcodeproj">
          </BuildableReference>
@@ -68,7 +68,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C84EB2FEED987DB13A41B90F"
-            BuildableName = "Claude Watch.app"
+            BuildableName = "Agent Watch.app"
             BlueprintName = "ClaudeWatch"
             ReferencedContainer = "container:ClaudeWatch.xcodeproj">
          </BuildableReference>
@@ -85,7 +85,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C84EB2FEED987DB13A41B90F"
-            BuildableName = "Claude Watch.app"
+            BuildableName = "Agent Watch.app"
             BlueprintName = "ClaudeWatch"
             ReferencedContainer = "container:ClaudeWatch.xcodeproj">
          </BuildableReference>

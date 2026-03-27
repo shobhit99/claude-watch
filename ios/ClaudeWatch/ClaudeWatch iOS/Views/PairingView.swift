@@ -37,12 +37,12 @@ struct PairingView: View {
     // MARK: - Subviews
 
     private var mascotIcon: some View {
-        ClaudeMascot(size: 64)
+        AppLogo(size: 88)
     }
 
     private var titleSection: some View {
         VStack(spacing: 8) {
-            Text("Claude Watch")
+            Text("Agent Watch")
                 .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(Color.claudeOrange)
 

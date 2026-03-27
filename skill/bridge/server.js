@@ -68,6 +68,11 @@ const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
+const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
+const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
+const CODEX_SESSION_SCAN_LIMIT = 25;
+const CODEX_SESSION_ROOT = path.join(os.homedir(), ".codex", "sessions");
+const CODEX_LOG_FILE = path.join(os.homedir(), ".codex", "log", "codex-tui.log");
 const BRIDGE_ID = crypto.randomUUID();
 
 // ---------------------------------------------------------------------------
@@ -102,6 +107,18 @@ const sseClients = new Set();
 const pendingPermissions = new Map();
 /** @type {Map<string, Array>} */
 const pendingPermissionBodies = new Map();
+/** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean}>} */
+const codexSessionFiles = new Map();
+/** @type {Map<string, {sessionId: string, name: string, args: Record<string, any>}>} */
+const codexPendingToolCalls = new Map();
+/** @type {Map<string, {command: string, justification: string, workdir: string, prefixRule: string[], createdAt: number}>} */
+const codexExecApprovalCandidates = new Map();
+/** @type {Map<string, {sessionId: string, optionCount: number, payload: Record<string, any>}>} */
+const codexSyntheticPermissions = new Map();
+/** @type {Map<string, string>} */
+const codexSyntheticPermissionBySession = new Map();
+const codexLogState = { offset: 0, remainder: "", initialized: false };
+let codexMonitorInterval = null;
 
 // Bonjour
 let bonjourInstance = null;
@@ -237,24 +254,15 @@ function formatSseMessage(entry) {
 // Multi-session PTY management
 // ---------------------------------------------------------------------------
 
-function spawnSession(agent, cwd) {
+function spawnInteractiveProcess(agent, cwd, args = []) {
   const bin = agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
   if (!bin) {
-    const msg = `Cannot spawn ${agent}: binary not found`;
-    log("error", msg);
-    pushSseEvent("error", { error: msg });
     return null;
   }
-
-  const sessionId = crypto.randomUUID();
-  const folderName = path.basename(cwd) || cwd;
   const cols = parseInt(process.env.COLUMNS, 10) || 120;
   const rows = parseInt(process.env.LINES, 10) || 40;
 
-  log("info", `Spawning ${agent} session ${sessionId} in PTY (cwd: ${cwd})`);
-  log("info", `Using binary: ${bin}`);
-
-  const proc = childSpawn("script", ["-q", "/dev/null", bin], {
+  return childSpawn("script", ["-q", "/dev/null", bin, ...args], {
     cwd,
     env: {
       ...process.env,
@@ -264,6 +272,52 @@ function spawnSession(agent, cwd) {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+}
+
+function bindPtyProcess(slot, proc) {
+  const sessionId = slot.id;
+  slot.ptyProcess = proc;
+
+  proc.stdout.on("data", (data) => {
+    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
+  });
+
+  proc.stderr.on("data", (data) => {
+    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
+  });
+
+  proc.on("close", (exitCode, signal) => {
+    log("info", `Session ${sessionId} (${slot.agent}) PTY exited: code=${exitCode} signal=${signal}`);
+    slot.state = "ended";
+    slot.ptyProcess = null;
+    clearCodexSyntheticPermissionForSession(sessionId, "pty-closed");
+    pushSseEvent("session", { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }, sessionId);
+  });
+
+  proc.on("error", (err) => {
+    log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
+    slot.state = "ended";
+    slot.ptyProcess = null;
+    clearCodexSyntheticPermissionForSession(sessionId, "pty-error");
+    pushSseEvent("session", { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }, sessionId);
+  });
+}
+
+function spawnSession(agent, cwd) {
+  const sessionId = crypto.randomUUID();
+  const folderName = path.basename(cwd) || cwd;
+
+  log("info", `Spawning ${agent} session ${sessionId} in PTY (cwd: ${cwd})`);
+
+  const proc = spawnInteractiveProcess(agent, cwd);
+  if (!proc) {
+    const msg = `Cannot spawn ${agent}: binary not found`;
+    log("error", msg);
+    pushSseEvent("error", { error: msg });
+    return null;
+  }
+
+  log("info", `Using binary: ${agent === "codex" ? CODEX_BIN : CLAUDE_BIN}`);
 
   const slot = {
     id: sessionId,
@@ -275,33 +329,27 @@ function spawnSession(agent, cwd) {
     createdAt: Date.now(),
   };
   sessions.set(sessionId, slot);
+  bindPtyProcess(slot, proc);
 
   pushSseEvent("session", { state: "running", agent, cwd, folderName }, sessionId);
 
-  proc.stdout.on("data", (data) => {
-    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
-  });
-
-  proc.stderr.on("data", (data) => {
-    pushSseEvent("pty-output", { text: data.toString() }, sessionId);
-  });
-
-  proc.on("close", (exitCode, signal) => {
-    log("info", `Session ${sessionId} (${agent}) PTY exited: code=${exitCode} signal=${signal}`);
-    slot.state = "ended";
-    slot.ptyProcess = null;
-    pushSseEvent("session", { state: "ended", exitCode, signal, agent, folderName }, sessionId);
-  });
-
-  proc.on("error", (err) => {
-    log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
-    slot.state = "ended";
-    slot.ptyProcess = null;
-    pushSseEvent("session", { state: "ended", error: err.message, agent, folderName }, sessionId);
-  });
-
   log("info", `${agent} session ${sessionId} started (${folderName}), pid: ${proc.pid}`);
   return sessionId;
+}
+
+function attachPtyToSession(slot) {
+  if (slot.ptyProcess) return slot.ptyProcess;
+
+  const args = slot.agent === "codex"
+    ? ["resume", slot.id, "--no-alt-screen"]
+    : [];
+
+  const proc = spawnInteractiveProcess(slot.agent, slot.cwd, args);
+  if (!proc) return null;
+
+  bindPtyProcess(slot, proc);
+  log("info", `Attached PTY to session ${slot.id} (${slot.agent}), pid: ${proc.pid}`);
+  return proc;
 }
 
 function killSession(sessionId) {
@@ -337,6 +385,18 @@ function findMostRecentActiveSession() {
   return best;
 }
 
+function findMostRecentRunningSession() {
+  let best = null;
+  for (const [, slot] of sessions) {
+    if (slot.state === "running") {
+      if (!best || slot.createdAt > best.createdAt) {
+        best = slot;
+      }
+    }
+  }
+  return best;
+}
+
 function getSessionsSnapshot() {
   return Array.from(sessions.values()).map((s) => ({
     id: s.id,
@@ -346,6 +406,503 @@ function getSessionsSnapshot() {
     state: s.state,
     createdAt: s.createdAt,
   }));
+}
+
+function safeStat(targetPath) {
+  try {
+    return fs.statSync(targetPath);
+  } catch {
+    return null;
+  }
+}
+
+function listRecentCodexSessionFiles(rootDir) {
+  const results = [];
+  const stack = [rootDir];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const stat = safeStat(fullPath);
+      if (!stat) continue;
+      results.push({ filePath: fullPath, mtimeMs: stat.mtimeMs, size: stat.size });
+    }
+  }
+
+  results.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return results.slice(0, CODEX_SESSION_SCAN_LIMIT);
+}
+
+function readFileSlice(filePath, start, length) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function touchExternalSession(sessionId, cwd, createdAt) {
+  const resolvedCwd = cwd || process.env.HOME || process.cwd();
+  const folderName = path.basename(resolvedCwd) || resolvedCwd;
+  const existing = sessions.get(sessionId);
+
+  if (existing) {
+    const wasEnded = existing.state !== "running";
+    existing.agent = "codex";
+    existing.cwd = resolvedCwd;
+    existing.folderName = folderName;
+    existing.state = "running";
+    existing.createdAt = createdAt || existing.createdAt || Date.now();
+    if (wasEnded) {
+      pushSseEvent("session", { state: "running", agent: "codex", cwd: resolvedCwd, folderName }, sessionId);
+      log("info", `Revived Codex session ${sessionId} (${folderName}) from local session data`);
+    }
+    return existing;
+  }
+
+  const slot = {
+    id: sessionId,
+    agent: "codex",
+    cwd: resolvedCwd,
+    folderName,
+    ptyProcess: null,
+    state: "running",
+    createdAt: createdAt || Date.now(),
+  };
+  sessions.set(sessionId, slot);
+  pushSseEvent("session", { state: "running", agent: "codex", cwd: resolvedCwd, folderName }, sessionId);
+  log("info", `Detected Codex session ${sessionId} (${folderName}) from local session data`);
+  return slot;
+}
+
+function endExternalSession(sessionId, reason = "codex-exit") {
+  const slot = sessions.get(sessionId);
+  if (!slot || slot.state === "ended") return;
+  slot.state = "ended";
+  slot.ptyProcess = null;
+  clearCodexSyntheticPermissionForSession(sessionId, reason);
+  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }, sessionId);
+  log("info", `Marked external session ${sessionId} as ended (${reason})`);
+}
+
+function parseJsonLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function parseFunctionCallArgs(rawArgs) {
+  if (typeof rawArgs !== "string") return {};
+  try {
+    const parsed = JSON.parse(rawArgs);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function extractPatchPaths(rawPatch) {
+  if (typeof rawPatch !== "string" || rawPatch.length === 0) return [];
+  const paths = [];
+  for (const line of rawPatch.split("\n")) {
+    const match = line.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/);
+    if (match) paths.push(match[1]);
+  }
+  return [...new Set(paths)];
+}
+
+function emitCodexToolEvent(sessionId, toolName, toolInput = {}, toolOutput = null) {
+  pushSseEvent("tool-output", {
+    source: "codex",
+    tool_name: toolName,
+    tool_input: toolInput,
+    tool_output: toolOutput,
+  }, sessionId);
+}
+
+function emitCodexToolResult(sessionId, pendingCall, output) {
+  if (!pendingCall || !sessionId) return;
+
+  switch (pendingCall.name) {
+    case "exec_command":
+      emitCodexToolEvent(sessionId, "Bash", { command: pendingCall.args.cmd || "" }, output);
+      break;
+    case "apply_patch": {
+      const patchPaths = extractPatchPaths(pendingCall.args.patch);
+      if (patchPaths.length === 0) {
+        emitCodexToolEvent(sessionId, "Edit", {}, output);
+        break;
+      }
+      for (const filePath of patchPaths) {
+        emitCodexToolEvent(sessionId, "Edit", { file_path: filePath }, output);
+      }
+      break;
+    }
+    default:
+      emitCodexToolEvent(sessionId, pendingCall.name, pendingCall.args, output);
+      break;
+  }
+}
+
+function truncateText(value, maxLength = 80) {
+  if (typeof value !== "string") return "";
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+}
+
+function buildCodexApprovalOptions(prefixRule = []) {
+  const options = [
+    {
+      label: "Yes, proceed",
+      description: "Run this command once",
+    },
+  ];
+
+  if (Array.isArray(prefixRule) && prefixRule.length > 0) {
+    options.push({
+      label: "Yes, don't ask again",
+      description: `Trust ${prefixRule.join(" ")} in future`,
+    });
+  }
+
+  options.push({
+    label: "No",
+    description: "Deny this command and return to Codex",
+  });
+
+  return options;
+}
+
+function recordCodexExecApprovalCandidate(line) {
+  const match = line.match(/ToolCall: exec_command (\{.*\}) thread_id=([0-9a-f-]+)/i);
+  if (!match) return;
+
+  let args;
+  try {
+    args = JSON.parse(match[1]);
+  } catch {
+    return;
+  }
+
+  if (args?.sandbox_permissions !== "require_escalated") return;
+
+  codexExecApprovalCandidates.set(match[2], {
+    command: args.cmd || "",
+    justification: args.justification || "Would you like to run this command?",
+    workdir: args.workdir || "",
+    prefixRule: Array.isArray(args.prefix_rule) ? args.prefix_rule : [],
+    createdAt: Date.now(),
+  });
+}
+
+function surfaceCodexExecApproval(sessionId) {
+  const slot = sessions.get(sessionId);
+  const candidate = codexExecApprovalCandidates.get(sessionId);
+  if (!slot || !candidate) return;
+
+  const existingId = codexSyntheticPermissionBySession.get(sessionId);
+  if (existingId) return;
+
+  const permissionId = crypto.randomUUID();
+  const options = buildCodexApprovalOptions(candidate.prefixRule);
+  const payload = {
+    permissionId,
+    source: "codex",
+    tool_name: "ExecApproval",
+    tool_input: {
+      command: candidate.command,
+      workdir: candidate.workdir,
+      questions: [
+        {
+          header: truncateText(`Run: ${candidate.command}`, 72),
+          question: candidate.justification || "Would you like to run this command?",
+          options,
+        },
+      ],
+    },
+  };
+  codexSyntheticPermissions.set(permissionId, { sessionId, optionCount: options.length, payload });
+  codexSyntheticPermissionBySession.set(sessionId, permissionId);
+
+  pushSseEvent("permission-request", payload, sessionId);
+
+  log("info", `Surfaced Codex approval ${permissionId} for session ${sessionId}`);
+}
+
+function clearCodexSyntheticPermissionForSession(sessionId, reason = "cleared") {
+  const permissionId = codexSyntheticPermissionBySession.get(sessionId);
+  if (!permissionId) return false;
+
+  codexSyntheticPermissionBySession.delete(sessionId);
+  codexSyntheticPermissions.delete(permissionId);
+  codexExecApprovalCandidates.delete(sessionId);
+  pushSseEvent("permission-cleared", { permissionId, reason }, sessionId);
+  return true;
+}
+
+function resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex) {
+  const synthetic = codexSyntheticPermissions.get(permissionId);
+  if (!synthetic) return false;
+
+  const slot = sessions.get(synthetic.sessionId);
+  if (!slot) return false;
+
+  const proc = slot.ptyProcess || attachPtyToSession(slot);
+  if (!proc || !proc.stdin) return false;
+
+  let input = "\u001b";
+  const normalizedIndex = Number.isInteger(optionIndex) ? optionIndex : -1;
+
+  if (normalizedIndex === 0 || /^yes,?\s*proceed/i.test(String(selectedOption || ""))) {
+    input = "y";
+  } else if (
+    synthetic.optionCount === 3
+    && (normalizedIndex === 1 || /^yes,?\s*don't ask again/i.test(String(selectedOption || "")))
+  ) {
+    input = "2\n";
+  }
+
+  proc.stdin.write(input);
+  clearCodexSyntheticPermissionForSession(synthetic.sessionId, "resolved");
+  log("info", `Resolved Codex approval ${permissionId} for session ${synthetic.sessionId}`);
+  return true;
+}
+
+function handleCodexJsonlLine(line, fileState, options = {}) {
+  const parsed = parseJsonLine(line);
+  if (!parsed) return;
+
+  const bootstrap = options.bootstrap === true;
+
+  if (parsed.type === "session_meta") {
+    const sessionId = parsed.payload?.id;
+    if (!sessionId) return;
+
+    fileState.sessionId = sessionId;
+    fileState.cwd = parsed.payload?.cwd || fileState.cwd;
+    fileState.createdAt = Date.parse(parsed.payload?.timestamp || parsed.timestamp || "") || fileState.createdAt || Date.now();
+
+    if (bootstrap && options.allowBootstrap !== true) return;
+
+    touchExternalSession(sessionId, fileState.cwd, fileState.createdAt);
+    return;
+  }
+
+  const sessionId = fileState.sessionId;
+  if (!sessionId || bootstrap) return;
+  if (!sessions.has(sessionId) || sessions.get(sessionId)?.state !== "running") {
+    touchExternalSession(sessionId, fileState.cwd, fileState.createdAt);
+  }
+
+  if (parsed.type === "response_item" && parsed.payload?.type === "function_call") {
+    const callId = parsed.payload.call_id;
+    if (!callId) return;
+    codexPendingToolCalls.set(callId, {
+      sessionId,
+      name: parsed.payload.name,
+      args: parseFunctionCallArgs(parsed.payload.arguments),
+    });
+    return;
+  }
+
+  if (parsed.type === "response_item" && parsed.payload?.type === "function_call_output") {
+    const pendingCall = codexPendingToolCalls.get(parsed.payload.call_id);
+    emitCodexToolResult(sessionId, pendingCall, parsed.payload.output ?? null);
+    if (parsed.payload.call_id) {
+      codexPendingToolCalls.delete(parsed.payload.call_id);
+    }
+    return;
+  }
+
+  if (parsed.type !== "event_msg") return;
+
+  const payloadType = parsed.payload?.type;
+  if (payloadType === "task_started") {
+    touchExternalSession(sessionId, fileState.cwd, fileState.createdAt);
+    return;
+  }
+  if (payloadType === "agent_message" && parsed.payload?.message) {
+    emitCodexToolEvent(sessionId, "CodexMessage", {}, parsed.payload.message);
+    return;
+  }
+  if (payloadType === "exec_command_end") {
+    const pendingCall = codexPendingToolCalls.get(parsed.payload.call_id);
+    const command = pendingCall?.args?.cmd
+      || (Array.isArray(parsed.payload.command) ? parsed.payload.command.join(" ") : "");
+    emitCodexToolEvent(sessionId, "Bash", { command }, parsed.payload.aggregated_output ?? null);
+    if (parsed.payload.call_id) {
+      codexPendingToolCalls.delete(parsed.payload.call_id);
+    }
+    return;
+  }
+  if (payloadType === "task_complete") {
+    pushSseEvent("task-complete", { source: "codex" }, sessionId);
+  }
+}
+
+function initializeCodexSessionFile(filePath, stat, fileState) {
+  const headerSize = Math.min(stat.size, 64 * 1024);
+  const header = headerSize > 0 ? readFileSlice(filePath, 0, headerSize) : "";
+  const allowBootstrap = Date.now() - stat.mtimeMs <= CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS;
+
+  for (const line of header.split("\n")) {
+    if (!line.trim()) continue;
+    handleCodexJsonlLine(line, fileState, { bootstrap: true, allowBootstrap });
+    if (fileState.sessionId) break;
+  }
+
+  fileState.offset = stat.size;
+  fileState.remainder = "";
+  fileState.initialized = true;
+}
+
+function readCodexSessionFileDelta(filePath, stat, fileState) {
+  if (stat.size < fileState.offset) {
+    fileState.offset = 0;
+    fileState.remainder = "";
+  }
+  if (stat.size === fileState.offset) return;
+
+  const delta = readFileSlice(filePath, fileState.offset, stat.size - fileState.offset);
+  fileState.offset = stat.size;
+
+  let chunk = fileState.remainder + delta;
+  const lines = chunk.split("\n");
+  fileState.remainder = lines.pop() ?? "";
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    handleCodexJsonlLine(line, fileState);
+  }
+}
+
+function scanCodexSessionFiles() {
+  const statRoot = safeStat(CODEX_SESSION_ROOT);
+  if (!statRoot || !statRoot.isDirectory()) return;
+
+  const seen = new Set();
+  for (const entry of listRecentCodexSessionFiles(CODEX_SESSION_ROOT)) {
+    seen.add(entry.filePath);
+    const fileState = codexSessionFiles.get(entry.filePath) || {
+      offset: 0,
+      remainder: "",
+      sessionId: null,
+      cwd: undefined,
+      createdAt: undefined,
+      initialized: false,
+    };
+
+    if (!fileState.initialized) {
+      initializeCodexSessionFile(entry.filePath, entry, fileState);
+      codexSessionFiles.set(entry.filePath, fileState);
+      continue;
+    }
+
+    readCodexSessionFileDelta(entry.filePath, entry, fileState);
+    codexSessionFiles.set(entry.filePath, fileState);
+  }
+
+  for (const filePath of codexSessionFiles.keys()) {
+    if (!seen.has(filePath)) {
+      codexSessionFiles.delete(filePath);
+    }
+  }
+}
+
+function consumeCodexLogChunk(text) {
+  const combined = codexLogState.remainder + text;
+  const lines = combined.split("\n");
+  codexLogState.remainder = lines.pop() ?? "";
+
+  for (const line of lines) {
+    recordCodexExecApprovalCandidate(line);
+
+    const approvalMatch = line.match(/thread_id=([0-9a-f-]+).*codex\.op="exec_approval".*codex_core::codex: (new|close)/i);
+    if (approvalMatch) {
+      const [, sessionId, state] = approvalMatch;
+      if (state === "new") {
+        surfaceCodexExecApproval(sessionId);
+      } else {
+        clearCodexSyntheticPermissionForSession(sessionId, "closed");
+      }
+    }
+
+    if (line.includes("Shutting down Codex instance")) {
+      const match = line.match(/thread_id=([0-9a-f-]+)/i);
+      if (match) {
+        clearCodexSyntheticPermissionForSession(match[1], "codex-shutdown");
+        endExternalSession(match[1], "codex-shutdown");
+      }
+    }
+  }
+}
+
+function scanCodexLog() {
+  const stat = safeStat(CODEX_LOG_FILE);
+  if (!stat || !stat.isFile()) return;
+
+  if (!codexLogState.initialized) {
+    const lookbackSize = Math.min(stat.size, 128 * 1024);
+    const startOffset = Math.max(0, stat.size - lookbackSize);
+    const bootstrapText = lookbackSize > 0 ? readFileSlice(CODEX_LOG_FILE, startOffset, lookbackSize) : "";
+    codexLogState.offset = stat.size;
+    codexLogState.remainder = "";
+    codexLogState.initialized = true;
+    if (bootstrapText) {
+      consumeCodexLogChunk(bootstrapText);
+    }
+    return;
+  }
+
+  if (stat.size < codexLogState.offset) {
+    codexLogState.offset = 0;
+    codexLogState.remainder = "";
+  }
+  if (stat.size === codexLogState.offset) return;
+
+  const text = readFileSlice(CODEX_LOG_FILE, codexLogState.offset, stat.size - codexLogState.offset);
+  codexLogState.offset = stat.size;
+  consumeCodexLogChunk(text);
+}
+
+function startCodexMonitor() {
+  if (codexMonitorInterval) return;
+
+  scanCodexSessionFiles();
+  scanCodexLog();
+
+  codexMonitorInterval = setInterval(() => {
+    try {
+      scanCodexSessionFiles();
+      scanCodexLog();
+    } catch (err) {
+      log("warn", `Codex monitor scan failed: ${err.message}`);
+    }
+  }, CODEX_SESSION_SCAN_INTERVAL_MS);
+}
+
+function stopCodexMonitor() {
+  if (codexMonitorInterval) {
+    clearInterval(codexMonitorInterval);
+    codexMonitorInterval = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +998,18 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  const { command, permissionId, decision, allowAll, agent, sessionId, spawn: spawnRequest, kill: killRequest } = body;
+  const {
+    command,
+    permissionId,
+    decision,
+    allowAll,
+    agent,
+    sessionId,
+    spawn: spawnRequest,
+    kill: killRequest,
+    selectedOption,
+    optionIndex,
+  } = body;
 
   // --- Spawn a new session ---
   if (spawnRequest) {
@@ -467,18 +1035,26 @@ async function handleCommand(req, res) {
   }
 
   // --- Permission response ---
-  if (permissionId && decision) {
-    if (allowAll && decision.behavior === "allow") {
-      decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
-    }
-    pendingPermissionBodies.delete(permissionId);
+  if (permissionId && (decision || selectedOption !== undefined || Number.isInteger(optionIndex))) {
+    if (decision) {
+      if (allowAll && decision.behavior === "allow") {
+        decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
+      }
+      pendingPermissionBodies.delete(permissionId);
 
-    const resolved = resolvePermission(permissionId, decision);
-    if (!resolved) {
-      return jsonResponse(res, 404, { error: "No pending permission with that ID" });
+      const resolved = resolvePermission(permissionId, decision);
+      if (resolved) {
+        log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll ? " (allow all)" : ""}`);
+        return jsonResponse(res, 200, { ok: true });
+      }
     }
-    log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll ? " (allow all)" : ""}`);
-    return jsonResponse(res, 200, { ok: true });
+
+    const resolvedSynthetic = resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex);
+    if (resolvedSynthetic) {
+      return jsonResponse(res, 200, { ok: true });
+    }
+
+    return jsonResponse(res, 404, { error: "No pending permission with that ID" });
   }
 
   // --- PTY command injection ---
@@ -490,48 +1066,26 @@ async function handleCommand(req, res) {
       targetSession = sessions.get(sessionId);
       if (targetSession && !targetSession.ptyProcess) {
         // Session exists but has no PTY (external hook-created session).
-        // Spawn a PTY in that session's cwd so the watch can interact.
-        log("info", `Session ${sessionId} has no PTY — spawning ${targetSession.agent} in ${targetSession.cwd}`);
-        const bin = targetSession.agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
-        if (bin) {
-          const cols = parseInt(process.env.COLUMNS, 10) || 120;
-          const rows = parseInt(process.env.LINES, 10) || 40;
-          const proc = childSpawn("script", ["-q", "/dev/null", bin], {
-            cwd: targetSession.cwd,
-            env: { ...process.env, TERM: "xterm-256color", COLUMNS: String(cols), LINES: String(rows) },
-            stdio: ["pipe", "pipe", "pipe"],
-          });
-          targetSession.ptyProcess = proc;
-          proc.stdout.on("data", (data) => pushSseEvent("pty-output", { text: data.toString() }, sessionId));
-          proc.stderr.on("data", (data) => pushSseEvent("pty-output", { text: data.toString() }, sessionId));
-          proc.on("close", (exitCode, signal) => {
-            targetSession.state = "ended";
-            targetSession.ptyProcess = null;
-            pushSseEvent("session", { state: "ended", exitCode, signal, agent: targetSession.agent, folderName: targetSession.folderName }, sessionId);
-          });
-          proc.on("error", (err) => {
-            targetSession.state = "ended";
-            targetSession.ptyProcess = null;
-            pushSseEvent("session", { state: "ended", error: err.message, agent: targetSession.agent, folderName: targetSession.folderName }, sessionId);
-          });
-          log("info", `Attached PTY to session ${sessionId}, pid: ${proc.pid}`);
-          // Wait for PTY to init, then write command
-          setTimeout(() => {
-            if (targetSession.ptyProcess) {
-              targetSession.ptyProcess.stdin.write(command);
-              log("info", `Command injected into session ${sessionId} (${command.length} chars)`);
-            }
-          }, 500);
-          return jsonResponse(res, 200, { ok: true, sessionId, agent: targetSession.agent, spawned: true });
+        // Attach to the existing session so the watch can interact with the live thread.
+        log("info", `Session ${sessionId} has no PTY — attaching to ${targetSession.agent} in ${targetSession.cwd}`);
+        const proc = attachPtyToSession(targetSession);
+        if (!proc) {
+          return jsonResponse(res, 500, { error: `No binary found for ${targetSession.agent}` });
         }
-        return jsonResponse(res, 500, { error: `No binary found for ${targetSession.agent}` });
+        setTimeout(() => {
+          if (targetSession.ptyProcess) {
+            targetSession.ptyProcess.stdin.write(command);
+            log("info", `Command injected into session ${sessionId} (${command.length} chars)`);
+          }
+        }, 500);
+        return jsonResponse(res, 200, { ok: true, sessionId, agent: targetSession.agent, spawned: true });
       }
       if (!targetSession) {
         return jsonResponse(res, 404, { error: "No session with that ID" });
       }
     } else {
       // Backward compat: route to the most recent active session
-      targetSession = findMostRecentActiveSession();
+      targetSession = findMostRecentActiveSession() || findMostRecentRunningSession();
     }
 
     if (!targetSession) {
@@ -611,6 +1165,19 @@ function handleEvents(req, res) {
       });
       try { res.write(syncEntry); } catch { /* ignore */ }
     }
+  }
+
+  for (const [permissionId, synthetic] of codexSyntheticPermissions) {
+    const syncEntry = formatSseMessage({
+      id: sseEventId++,
+      event: "permission-request",
+      data: JSON.stringify({
+        ...synthetic.payload,
+        permissionId,
+        sessionId: synthetic.sessionId,
+      }),
+    });
+    try { res.write(syncEntry); } catch { /* ignore */ }
   }
 
   const heartbeat = setInterval(() => {
@@ -770,6 +1337,7 @@ async function handleHookError(req, res) {
 }
 
 function handleStatus(_req, res) {
+  const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,
     sessionId: BRIDGE_ID, // backward compat
@@ -777,11 +1345,11 @@ function handleStatus(_req, res) {
     availableAgents: availableAgentsList(),
     sessions: getSessionsSnapshot(),
     sseClients: sseClients.size,
-    pendingPermissions: pendingPermissions.size,
+    pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
-    activeAgent: findMostRecentActiveSession()?.agent || null,
+    activeAgent: mostRecentRunningSession?.agent || null,
   });
 }
 
@@ -876,6 +1444,7 @@ async function startServer() {
   });
 
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
+  startCodexMonitor();
 
   const agents = [];
   if (CLAUDE_BIN) agents.push("Claude");
@@ -929,6 +1498,7 @@ async function startServer() {
       }
     }
     sessions.clear();
+    stopCodexMonitor();
 
     if (bonjourService) {
       try { bonjourInstance.unpublishAll(); } catch { /* ignore */ }

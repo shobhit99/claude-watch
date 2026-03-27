@@ -1,5 +1,17 @@
 import SwiftUI
 
+struct AppLogo: View {
+    var size: CGFloat = 32
+
+    var body: some View {
+        Image("AppLogo")
+            .resizable()
+            .renderingMode(.original)
+            .scaledToFit()
+            .frame(width: size, height: size)
+    }
+}
+
 /// The official Claude logo rendered as a SwiftUI view.
 /// Uses the actual SVG path data from Anthropic's brand assets.
 struct ClaudeMascot: View {

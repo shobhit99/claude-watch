@@ -17,8 +17,8 @@ struct OnboardingView: View {
         VStack(spacing: 6) {
             // Compact header — one line
             HStack(spacing: 4) {
-                ClaudeMascot(size: 16)
-                Text("Claude Watch")
+                AppLogo(size: 22)
+                Text("Agent Watch")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(Theme.Text.primary)
             }

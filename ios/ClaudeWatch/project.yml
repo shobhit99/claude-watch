@@ -22,7 +22,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch
         INFOPLIST_FILE: "ClaudeWatch iOS/Info.plist"
-        PRODUCT_NAME: Claude Watch
+        PRODUCT_NAME: Agent Watch
         GENERATE_INFOPLIST_FILE: false
     dependencies:
       - target: ClaudeWatchWatch
@@ -38,7 +38,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch.watchkitapp
         INFOPLIST_FILE: "ClaudeWatch watchOS/Info.plist"
-        PRODUCT_NAME: Claude Watch
+        PRODUCT_NAME: Agent Watch
         GENERATE_INFOPLIST_FILE: false
         SUPPORTS_MACCATALYST: false
         ARCHS: "arm64 arm64e arm64_32"

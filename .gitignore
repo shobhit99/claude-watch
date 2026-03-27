@@ -1,1 +1,18 @@
-**/node_modules/*
+**/node_modules/
+
+# Build outputs
+**/build/
+**/DerivedData/
+
+# Xcode user state
+**/xcuserdata/
+**/*.xcuserstate
+
+# macOS filesystem noise
+.DS_Store
+**/.DS_Store
+
+# Editor temp files
+*.swp
+*.swo
+*~

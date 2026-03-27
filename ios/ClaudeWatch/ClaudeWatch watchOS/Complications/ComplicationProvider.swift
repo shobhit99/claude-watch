@@ -129,7 +129,7 @@ struct ClaudeWatchComplication: Widget {
             ClaudeWatchRectangularView(entry: entry)
                 .containerBackground(Theme.Background.primary, for: .widget)
         }
-        .configurationDisplayName("Claude Watch")
+        .configurationDisplayName("Agent Watch")
         .description("Shows Claude session status and latest output.")
         .supportedFamilies([.accessoryRectangular])
     }

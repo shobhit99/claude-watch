@@ -19,7 +19,7 @@ struct MultiSessionPager: View {
 
     private var waitingView: some View {
         VStack(spacing: 8) {
-            ClaudeMascot(size: 24)
+            AppLogo(size: 34)
                 .opacity(0.6)
             Text("Waiting for session...")
                 .font(.system(size: 11, weight: .medium))
@@ -38,4 +38,3 @@ struct MultiSessionPager: View {
     MultiSessionPager()
         .environmentObject(WatchViewState.shared)
 }
-

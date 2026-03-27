@@ -176,6 +176,9 @@ class WatchViewState: ObservableObject {
         case "permission-request":
             handlePermissionRequest(json, sessionId: sessionId)
 
+        case "permission-cleared":
+            handlePermissionCleared(json, sessionId: sessionId)
+
         case "stop":
             removeThinkingLine(sessionId: sessionId)
             appendLine(TerminalLine(text: "— stopped —", type: .system), sessionId: sessionId)
@@ -270,7 +273,9 @@ class WatchViewState: ObservableObject {
         if let questions = toolInput["questions"] as? [[String: Any]],
            let firstQ = questions.first {
             question = firstQ["question"] as? String
-            desc = firstQ["header"] as? String ?? toolName
+            desc = toolInput["command"] as? String
+                ?? firstQ["header"] as? String
+                ?? toolName
             if let opts = firstQ["options"] as? [[String: Any]] {
                 options = opts.map { opt in
                     ApprovalRequest.OptionItem(
@@ -301,6 +306,7 @@ class WatchViewState: ObservableObject {
         }
 
         let approval = ApprovalRequest(
+            permissionId: permissionId,
             toolName: toolName, actionSummary: desc,
             question: question, options: options
         )
@@ -317,6 +323,36 @@ class WatchViewState: ObservableObject {
         }
 
         HapticManager.approvalNeeded()
+    }
+
+    private func handlePermissionCleared(_ json: [String: Any], sessionId: String?) {
+        let permissionId = json["permissionId"] as? String
+
+        if pendingApproval?.permissionId == permissionId || permissionId == nil {
+            pendingApproval = nil
+        }
+
+        if let sid = sessionId, let idx = sessionIndex(for: sid) {
+            if sessions[idx].pendingApproval?.permissionId == permissionId || permissionId == nil {
+                sessions[idx].pendingApproval = nil
+                if sessions[idx].activity == .waitingApproval {
+                    sessions[idx].activity = .running
+                }
+            }
+        } else {
+            for idx in sessions.indices {
+                if sessions[idx].pendingApproval?.permissionId == permissionId || permissionId == nil {
+                    sessions[idx].pendingApproval = nil
+                    if sessions[idx].activity == .waitingApproval {
+                        sessions[idx].activity = .running
+                    }
+                }
+            }
+        }
+
+        if UserDefaults.standard.string(forKey: "watch_pending_permission") == permissionId || permissionId == nil {
+            UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
+        }
     }
 
     private func handleSessionEvent(_ json: [String: Any], sessionId: String?) {
@@ -364,8 +400,9 @@ class WatchViewState: ObservableObject {
 
     // MARK: - Permission response
 
-    func respondToPermissionWithOption(_ optionLabel: String) {
-        guard let permissionId = UserDefaults.standard.string(forKey: "watch_pending_permission"),
+    func respondToPermissionWithOption(_ optionLabel: String, index: Int) {
+        let approval = pendingApproval ?? activeSession?.pendingApproval
+        guard let permissionId = approval?.permissionId ?? UserDefaults.standard.string(forKey: "watch_pending_permission"),
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
         pendingApproval = nil
@@ -376,25 +413,27 @@ class WatchViewState: ObservableObject {
         }
 
         let url = baseURL.appendingPathComponent("command")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let body: [String: Any] = [
             "permissionId": permissionId,
             "decision": ["behavior": "allow"],
-            "selectedOption": optionLabel
+            "selectedOption": optionLabel,
+            "optionIndex": index
         ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        urlRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: request).resume()
+        URLSession.shared.dataTask(with: urlRequest).resume()
         appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command), sessionId: activeSession?.id)
         UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
     }
 
     func respondToPermission(approved: Bool) {
-        guard let permissionId = UserDefaults.standard.string(forKey: "watch_pending_permission"),
+        let approval = pendingApproval ?? activeSession?.pendingApproval
+        guard let permissionId = approval?.permissionId ?? UserDefaults.standard.string(forKey: "watch_pending_permission"),
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
         pendingApproval = nil
@@ -404,18 +443,18 @@ class WatchViewState: ObservableObject {
         }
 
         let url = baseURL.appendingPathComponent("command")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let body: [String: Any] = [
             "permissionId": permissionId,
             "decision": ["behavior": approved ? "allow" : "deny"]
         ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        urlRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: request) { _, _, error in
+        URLSession.shared.dataTask(with: urlRequest) { _, _, error in
             if let error { print("[WatchViewState] Permission response failed: \(error)") }
         }.resume()
 

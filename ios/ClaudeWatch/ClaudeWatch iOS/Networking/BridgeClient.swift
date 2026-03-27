@@ -144,7 +144,7 @@ final class BridgeClient {
             "behavior": allow ? "allow" : "deny"
         ]
         if !allow {
-            decision["message"] = "Denied from Claude Watch app"
+            decision["message"] = "Denied from Agent Watch app"
         }
         let body: [String: Any] = [
             "permissionId": requestId,

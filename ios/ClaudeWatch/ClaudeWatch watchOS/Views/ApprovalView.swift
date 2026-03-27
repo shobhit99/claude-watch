@@ -96,7 +96,7 @@ struct ApprovalView: View {
         // For AskUserQuestion: send the option label
         // For permission prompts: first = allow, last = deny
         if request.question != nil {
-            session.respondToPermissionWithOption(option.label)
+            session.respondToPermissionWithOption(option.label, index: index)
         } else {
             let approved = index != request.options.count - 1
             session.respondToPermission(approved: approved)

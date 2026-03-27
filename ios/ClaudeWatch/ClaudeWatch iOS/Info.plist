@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Claude Watch</string>
+	<string>Agent Watch</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,7 +25,7 @@
 		<string>_claude-watch._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Claude Watch needs to find your Mac running the Claude Watch bridge server on your local network.</string>
+	<string>Agent Watch needs to find your Mac running the Agent Watch bridge server on your local network.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
