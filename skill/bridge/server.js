@@ -81,6 +81,7 @@ function parseCliArgs(argv) {
     tunnelEnabled: null,
     tunnelMode: null,
     cfToken: null,
+    ingressToken: null,
     tunnelPublicUrl: null,
     cloudflaredBin: null,
     defaultCwd: null,
@@ -129,6 +130,12 @@ function parseCliArgs(argv) {
       i = nextIndex;
       continue;
     }
+    if (arg.startsWith("--ingress-token")) {
+      const { value, nextIndex } = readValue(arg, i, "--ingress-token");
+      result.ingressToken = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
     if (arg.startsWith("--tunnel-public-url")) {
       const { value, nextIndex } = readValue(arg, i, "--tunnel-public-url");
       result.tunnelPublicUrl = parseOptionalString(value);
@@ -156,6 +163,7 @@ function loadBridgeConfig(configPath) {
       enabled: null,
       mode: null,
       token: null,
+      ingressToken: null,
       publicUrl: null,
       cloudflaredBin: null,
     },
@@ -176,6 +184,7 @@ function loadBridgeConfig(configPath) {
         enabled: firstDefined(parseOptionalBool(tunnel.enabled), defaults.tunnel.enabled),
         mode: firstDefined(normalizeTunnelMode(tunnel.mode), defaults.tunnel.mode),
         token: firstDefined(parseOptionalString(tunnel.token), defaults.tunnel.token),
+        ingressToken: firstDefined(parseOptionalString(tunnel.ingressToken), defaults.tunnel.ingressToken),
         publicUrl: firstDefined(parseOptionalString(tunnel.publicUrl), defaults.tunnel.publicUrl),
         cloudflaredBin: firstDefined(parseOptionalString(tunnel.cloudflaredBin), defaults.tunnel.cloudflaredBin),
       },
@@ -212,6 +221,12 @@ const TUNNEL_TOKEN = firstDefined(
   BRIDGE_CONFIG.tunnel.token,
   null,
 );
+const CONFIGURED_INGRESS_BEARER_TOKEN = firstDefined(
+  CLI_OPTIONS.ingressToken,
+  parseOptionalString(process.env.CLAUDE_WATCH_INGRESS_TOKEN),
+  BRIDGE_CONFIG.tunnel.ingressToken,
+  null,
+);
 const TUNNEL_PUBLIC_URL = firstDefined(
   CLI_OPTIONS.tunnelPublicUrl,
   parseOptionalString(process.env.CLAUDE_WATCH_TUNNEL_PUBLIC_URL),
@@ -235,6 +250,12 @@ if (TUNNEL_ENABLED) {
     log("warn", "Tunnel mode is token but no token provided, fallback to quick mode.");
     TUNNEL_MODE = "quick";
   }
+}
+
+let INGRESS_BEARER_TOKEN = parseOptionalString(CONFIGURED_INGRESS_BEARER_TOKEN);
+if (!INGRESS_BEARER_TOKEN && TUNNEL_ENABLED) {
+  INGRESS_BEARER_TOKEN = crypto.randomBytes(24).toString("hex");
+  log("warn", "Tunnel enabled but no ingress token configured. Generated a one-time Bearer token.");
 }
 
 const DEFAULT_SPAWN_CWD = firstDefined(
@@ -277,6 +298,9 @@ if (TUNNEL_ENABLED) {
   } else {
     log("warn", "Tunnel is enabled, but cloudflared was not found. Tunnel will stay disabled.");
   }
+}
+if (INGRESS_BEARER_TOKEN) {
+  log("info", "Ingress Bearer auth is enabled for pairing/status endpoints.");
 }
 
 // ---------------------------------------------------------------------------
@@ -397,11 +421,27 @@ function recordRateLimitAttempt() {
   rateLimitAttempts++;
 }
 
-function requireAuth(req) {
+function extractBearerToken(req) {
   const auth = req.headers["authorization"];
-  if (!auth || !auth.startsWith("Bearer ")) return false;
-  const token = auth.slice(7);
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return auth.slice(7);
+}
+
+function requireAuth(req) {
+  const token = extractBearerToken(req);
   return token === sessionToken && sessionToken !== null;
+}
+
+function requireIngressAuth(req) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  return extractBearerToken(req) === INGRESS_BEARER_TOKEN;
+}
+
+function requireIngressOrSessionAuth(req) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  const token = extractBearerToken(req);
+  if (!token) return false;
+  return token === INGRESS_BEARER_TOKEN || (sessionToken !== null && token === sessionToken);
 }
 
 function jsonResponse(res, status, body) {
@@ -442,6 +482,7 @@ function getTunnelStatus() {
     provider: tunnelState.provider,
     mode: tunnelState.mode,
     status: tunnelState.status,
+    ingressAuthRequired: Boolean(INGRESS_BEARER_TOKEN),
     localUrl: tunnelState.localUrl,
     publicUrl: tunnelState.publicUrl,
     error: tunnelState.error,
@@ -1317,6 +1358,9 @@ async function handlePair(req, res) {
   if (req.method !== "POST") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
+  if (!requireIngressAuth(req)) {
+    return jsonResponse(res, 401, { error: "Unauthorized: missing or invalid ingress Bearer token" });
+  }
 
   if (isRateLimited()) {
     return jsonResponse(res, 429, { error: "Too many pairing attempts. Try again later." });
@@ -1766,6 +1810,9 @@ async function handleHookError(req, res) {
 }
 
 function handleStatus(_req, res) {
+  if (!requireIngressOrSessionAuth(_req)) {
+    return jsonResponse(res, 401, { error: "Unauthorized: missing or invalid Bearer token" });
+  }
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,
@@ -1776,6 +1823,7 @@ function handleStatus(_req, res) {
     sseClients: sseClients.size,
     pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
+    ingressAuthRequired: Boolean(INGRESS_BEARER_TOKEN),
     localEndpoint: currentBoundPort ? `http://${currentLanIP}:${currentBoundPort}` : null,
     publicEndpoint: tunnelState.publicUrl,
     tunnel: getTunnelStatus(),
@@ -1919,6 +1967,9 @@ async function startServer() {
   if (TUNNEL_ENABLED) {
     console.log(`Tunnel Mode: ${TUNNEL_MODE}`);
     console.log(`Tunnel URL:  ${tunnelState.publicUrl || "starting..."}`);
+  }
+  if (INGRESS_BEARER_TOKEN) {
+    console.log(`Ingress Bearer Token: ${INGRESS_BEARER_TOKEN}`);
   }
   console.log("");
 

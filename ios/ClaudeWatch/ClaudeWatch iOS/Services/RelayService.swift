@@ -56,12 +56,18 @@ final class RelayService: ObservableObject {
     private init() {
         isPaired = bridgeClient.isPaired
         transportMode = inferTransportMode(from: bridgeClient.baseURL)
+        discovery.ingressToken = bridgeClient.ingressToken
         setupWatchMessageHandler()
         setupSSEEventHandler()
 
         if isPaired {
             Task { await reconnect() }
         }
+    }
+
+    func setIngressToken(_ token: String?) {
+        bridgeClient.configureIngressToken(token)
+        discovery.ingressToken = bridgeClient.ingressToken
     }
 
     // MARK: - Pairing
@@ -96,7 +102,7 @@ final class RelayService: ObservableObject {
     }
 
     /// Pairs using a manual endpoint.
-    /// 支持完整 URL（https://...）或传统 IP（自动扫描 7860-7869）。
+    /// Supports a full URL (https://...) or a plain IP/host (auto-scans 7860-7869).
     func pairWithEndpoint(_ endpoint: String, code: String) async throws {
         let input = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { throw BridgeClient.BridgeError.networkError }

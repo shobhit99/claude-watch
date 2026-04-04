@@ -3,6 +3,7 @@
     "enabled": false,
     "mode": "quick",
     "token": "",
+    "ingressToken": "",
     "publicUrl": "",
     "cloudflaredBin": ""
   }

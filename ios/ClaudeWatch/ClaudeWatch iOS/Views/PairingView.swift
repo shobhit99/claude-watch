@@ -15,6 +15,7 @@ struct PairingView: View {
     @State private var showError: Bool = false
     @State private var errorMessage: String = ""
     @State private var isConnecting: Bool = false
+    @State private var ingressToken: String = UserDefaults.standard.string(forKey: "bridge_ingress_token") ?? ""
 
     // MARK: - Body
 
@@ -55,7 +56,7 @@ struct PairingView: View {
                 .foregroundStyle(Color.claudeOrange)
 
             Text(showManualIP
-                 ? "输入桥接地址和配对码"
+                 ? "Enter your bridge endpoint and pairing code"
                  : "Enter the pairing code from your Mac")
                 .font(.system(size: 15))
                 .foregroundStyle(Color.subtleText)
@@ -65,7 +66,7 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("https://xxx.trycloudflare.com 或 192.168.1.x", text: $endpoint)
+            TextField("https://xxx.trycloudflare.com or 192.168.1.x", text: $endpoint)
                 .keyboardType(.URL)
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
@@ -153,11 +154,26 @@ struct PairingView: View {
                         isIPFocused = true
                     }
                 } label: {
-                    Text("无法自动连接？手动输入地址")
+                    Text("Can't connect? Enter endpoint manually")
                         .font(.system(size: 13))
                         .foregroundStyle(Color.claudeOrange)
                 }
             }
+
+            SecureField("Ingress Bearer token (optional)", text: $ingressToken)
+                .textContentType(.password)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(.white)
+                .tint(Color.claudeOrange)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.cardBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.fieldBorder, lineWidth: 1)
+                )
 
             Text("Run `node server.js` in the bridge folder to start")
                 .font(.system(size: 13, design: .monospaced))
@@ -196,6 +212,7 @@ struct PairingView: View {
         isConnecting = true
         isCodeFocused = false
         isIPFocused = false
+        relayService.setIngressToken(ingressToken)
 
         Task {
             do {
@@ -203,7 +220,7 @@ struct PairingView: View {
                     let input = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !input.isEmpty else {
                         await MainActor.run {
-                            showPairingError("请输入桥接地址（IP 或 URL）。")
+                            showPairingError("Please enter a bridge endpoint (IP or URL).")
                         }
                         return
                     }
@@ -219,10 +236,10 @@ struct PairingView: View {
                     // If auto-discovery failed, suggest manual IP
                     if msg.contains("noServiceFound") || msg.contains("timed out") || msg.contains("not found") {
                         showManualIP = true
-                        showPairingError("未自动发现桥接服务，请输入 IP 或完整 URL。")
+                        showPairingError("Bridge not found automatically. Enter IP or full URL.")
                         isIPFocused = true
                     } else {
-                        showPairingError("连接失败：\(msg)")
+                        showPairingError("Connection failed: \(msg)")
                     }
                 }
             }
@@ -238,13 +255,15 @@ struct PairingView: View {
             showPairingError("Code expired. A new code has been generated on your Mac.")
         case .rateLimited:
             showPairingError("Too many attempts. Please wait a few minutes.")
+        case .unauthorized:
+            showPairingError("Authorization failed. Check your Ingress Bearer token.")
         case .networkError:
             if !showManualIP {
                 showManualIP = true
-                showPairingError("无法连接桥接服务，请输入 IP 或完整 URL。")
+                showPairingError("Can't reach bridge. Enter IP or full URL.")
                 isIPFocused = true
             } else {
-                showPairingError("无法连接桥接服务，请检查地址与网络。")
+                showPairingError("Cannot reach bridge server. Check endpoint and network.")
             }
         case .serverError(let msg):
             showPairingError(msg)

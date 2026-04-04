@@ -6,6 +6,7 @@ struct OnboardingView: View {
 
     @State private var code = ""
     @State private var endpointInput = ""
+    @State private var ingressToken = UserDefaults.standard.string(forKey: "watch_bridge_ingress_token") ?? ""
     @State private var isSearching = false
     @State private var isConnecting = false
     @State private var error: String?
@@ -56,21 +57,31 @@ struct OnboardingView: View {
                         .scaleEffect(0.7)
                 }
 
+                SecureField("Ingress Bearer token (optional)", text: $ingressToken)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Theme.Text.primary)
+                    .multilineTextAlignment(.center)
+
             } else {
                 // Not found — IP entry right away
-                Text("输入桥接地址")
+                Text("Enter bridge endpoint")
                     .font(.system(size: 11))
                     .foregroundColor(Theme.Text.secondary)
 
-                Text("支持 IP 或完整 URL")
+                Text("Supports IP or full URL")
                     .font(.system(size: 9))
                     .foregroundColor(Theme.Text.dimmed)
 
-                TextField("https://xxx.trycloudflare.com 或 192.168.1.x", text: $endpointInput)
+                TextField("https://xxx.trycloudflare.com or 192.168.1.x", text: $endpointInput)
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                     .foregroundColor(Theme.Text.primary)
                     .multilineTextAlignment(.center)
                     .focused($ipFocused)
+
+                SecureField("Ingress Bearer token (optional)", text: $ingressToken)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Theme.Text.primary)
+                    .multilineTextAlignment(.center)
 
                 Button { connectManual() } label: {
                     Text("Connect")
@@ -108,6 +119,7 @@ struct OnboardingView: View {
     private func connectManual() {
         let input = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
+        bridge.setIngressToken(ingressToken)
         isSearching = true
         error = nil
 
@@ -116,6 +128,9 @@ struct OnboardingView: View {
                 let statusURL = directURL.appendingPathComponent("status")
                 var request = URLRequest(url: statusURL)
                 request.timeoutInterval = 3
+                if let token = bridge.ingressToken, !token.isEmpty {
+                    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                }
                 do {
                     let (_, response) = try await URLSession.shared.data(for: request)
                     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
@@ -134,6 +149,9 @@ struct OnboardingView: View {
                     let url = URL(string: "http://\(input):\(port)/status")!
                     var request = URLRequest(url: url)
                     request.timeoutInterval = 3
+                    if let token = bridge.ingressToken, !token.isEmpty {
+                        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    }
                     do {
                         let (_, response) = try await URLSession.shared.data(for: request)
                         if let http = response as? HTTPURLResponse, http.statusCode == 200 {
@@ -149,7 +167,7 @@ struct OnboardingView: View {
             }
             await MainActor.run {
                 isSearching = false
-                self.error = "无法连接：\(input)"
+                self.error = "Cannot reach: \(input)"
             }
         }
     }
@@ -200,6 +218,7 @@ struct OnboardingView: View {
     }
 
     private func searchForBridge() {
+        bridge.setIngressToken(ingressToken)
         isSearching = true
         error = nil
         Task {
@@ -215,6 +234,7 @@ struct OnboardingView: View {
 
     private func submitCode(_ code: String) {
         guard let url = bridgeURL, !isConnecting else { return }
+        bridge.setIngressToken(ingressToken)
         isConnecting = true
         error = nil
 

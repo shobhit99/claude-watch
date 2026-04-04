@@ -12,7 +12,7 @@ to the Agent Watch iOS/watchOS app.
 
 ## What it does
 - Runs a Node.js bridge server on your LAN
-- 可选启用 Cloudflare Tunnel（Quick / Token）
+- Optional Cloudflare Tunnel support (Quick / Token)
 - Registers HTTP hooks for real-time event forwarding
 - Generates a 6-digit pairing code for the iPhone app
 - Enables voice commands from your Apple Watch
@@ -24,4 +24,4 @@ Enter the pairing code in the Agent Watch iPhone app.
 ## Setup
 The bridge requires Node.js 18+ and the `node-pty` package.
 Run the setup script: `cd skill/bridge && npm install`
-如需远程连接，可运行：`./skill/setup-cloudflared.sh`
+For remote access, run: `./skill/setup-cloudflared.sh`

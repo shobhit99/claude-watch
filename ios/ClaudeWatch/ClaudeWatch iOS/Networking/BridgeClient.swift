@@ -9,6 +9,7 @@ final class BridgeClient {
         case invalidCode
         case expired
         case rateLimited
+        case unauthorized
         case networkError
         case serverError(String)
 
@@ -17,6 +18,7 @@ final class BridgeClient {
             case .invalidCode:      return "Invalid pairing code."
             case .expired:          return "Pairing code expired."
             case .rateLimited:      return "Too many attempts. Try again later."
+            case .unauthorized:     return "Bearer token invalid or missing."
             case .networkError:     return "Cannot reach bridge server."
             case .serverError(let msg): return msg
             }
@@ -27,6 +29,7 @@ final class BridgeClient {
 
     private(set) var baseURL: URL?
     private(set) var token: String?
+    private(set) var ingressToken: String?
 
     private let session: URLSession
 
@@ -40,6 +43,7 @@ final class BridgeClient {
 
         // Restore saved token
         self.token = UserDefaults.standard.string(forKey: "bridge_token")
+        self.ingressToken = UserDefaults.standard.string(forKey: "bridge_ingress_token")
         if let saved = UserDefaults.standard.string(forKey: "bridge_url") {
             self.baseURL = URL(string: saved)
         }
@@ -57,6 +61,16 @@ final class BridgeClient {
         guard let normalized = normalizedBaseURL(from: baseURL) else { return }
         self.baseURL = normalized
         UserDefaults.standard.set(normalized.absoluteString, forKey: "bridge_url")
+    }
+
+    func configureIngressToken(_ token: String?) {
+        let trimmed = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ingressToken = trimmed.isEmpty ? nil : trimmed
+        if let ingressToken {
+            UserDefaults.standard.set(ingressToken, forKey: "bridge_ingress_token")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "bridge_ingress_token")
+        }
     }
 
     var isPaired: Bool {
@@ -84,6 +98,9 @@ final class BridgeClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let ingressToken {
+            request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = try JSONEncoder().encode(["code": code])
 
         let (data, response) = try await performRequest(request)
@@ -103,6 +120,9 @@ final class BridgeClient {
             let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
             if body?.error.contains("expired") == true {
                 throw BridgeError.expired
+            }
+            if body?.error.lowercased().contains("unauthorized") == true {
+                throw BridgeError.unauthorized
             }
             throw BridgeError.invalidCode
 
@@ -189,7 +209,12 @@ final class BridgeClient {
     func fetchStatus() async throws -> BridgeStatus {
         guard let baseURL else { throw BridgeError.networkError }
         let url = baseURL.appendingPathComponent("status")
-        let request = URLRequest(url: url)
+        var request = URLRequest(url: url)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        } else if let ingressToken {
+            request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+        }
         let (data, _) = try await performRequest(request)
         return try JSONDecoder().decode(BridgeStatus.self, from: data)
     }

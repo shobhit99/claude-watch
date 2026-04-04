@@ -32,7 +32,7 @@ https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
 - **Voice commands** — dictate commands to Claude via watchOS dictation
 - **iPhone companion** — pairing UI, connection status, terminal preview, permission approvals
 - **Bridge server** — Node.js server on your Mac that connects Claude Code to the watch via HTTP hooks + SSE
-- **Cloudflare Tunnel (可选)** — 支持 Quick Tunnel 随机公网地址，或使用 Token 连接你自己的域名
+- **Cloudflare Tunnel (optional)** — supports Quick Tunnel random public URLs or Token mode for your own domain
 
 ## Architecture
 
@@ -44,7 +44,7 @@ A Node.js HTTP server (`skill/bridge/server.js`) that:
 - Streams events to connected clients via Server-Sent Events (SSE)
 - Handles pairing with a 6-digit code + session token
 - Advertises itself on the local network via Bonjour/mDNS
-- 可选启动 Cloudflare Tunnel（Quick / Token）
+- Optional Cloudflare Tunnel startup (Quick / Token)
 - Blocks on `PermissionRequest` hooks — waits for watch/phone approval, then returns the decision to Claude Code
 
 ### 2. iPhone App
@@ -82,7 +82,7 @@ cd skill/bridge
 npm install
 ```
 
-可选：自动安装 cloudflared（用于远程 tunnel）
+Optional: install cloudflared automatically (for remote tunnel)
 
 ```bash
 ./skill/setup-cloudflared.sh
@@ -116,11 +116,12 @@ You'll see:
 ╚═══════════════════════════════════════╝
 ```
 
-如果开启 tunnel，还会额外看到类似输出：
+If tunnel is enabled, you will also see output like:
 
 ```text
 Tunnel Mode: quick
 Tunnel URL:  https://random-words.trycloudflare.com
+Ingress Bearer Token: xxxxx
 ```
 
 ### 4. Build the iOS + watchOS apps
@@ -140,7 +141,7 @@ In Xcode:
 
 **iPhone:** Enter the 6-digit pairing code from the bridge banner.
 
-**Apple Watch:** The app auto-discovers the bridge via Bonjour. If that fails, enter IP 或完整 endpoint URL（例如 `https://xxx.trycloudflare.com`）。
+**Apple Watch:** The app auto-discovers the bridge via Bonjour. If that fails, enter an IP or a full endpoint URL (for example `https://xxx.trycloudflare.com`).
 
 ### 6. Use Claude Code normally
 
@@ -252,9 +253,9 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
 |---------|---------|-------------|
 | `PORT` | 7860 | Starting port (tries 7860-7869) |
 
-### Cloudflare Tunnel 配置（可选）
+### Cloudflare Tunnel configuration (optional)
 
-复制 `skill/bridge/bridge.config.example.json` 为 `skill/bridge/bridge.config.json`，并按需修改：
+Copy `skill/bridge/bridge.config.example.json` to `skill/bridge/bridge.config.json`, then edit as needed:
 
 ```json
 {
@@ -262,19 +263,23 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
     "enabled": true,
     "mode": "quick",
     "token": "",
+    "ingressToken": "YOUR_SHARED_BEARER_TOKEN",
     "publicUrl": ""
   }
 }
 ```
 
-- `mode=quick`：自动申请 `trycloudflare.com` 随机地址  
-- `mode=token`：使用 `token` 启动命名隧道（自定义域名由 Cloudflare 侧配置）
+- `mode=quick`: requests a random `trycloudflare.com` URL automatically  
+- `mode=token`: starts a named tunnel with `token` (your custom domain is configured in Cloudflare)
+- `ingressToken`: required Bearer token for `/pair` and `/status` when remote access is enabled  
+  (enter the same token in iPhone/watch pairing UI)
 
-也可用环境变量/CLI 覆盖：
+You can also override by environment variables / CLI:
 
 ```bash
 CLAUDE_WATCH_TUNNEL_ENABLED=true \
 CLAUDE_WATCH_TUNNEL_MODE=quick \
+CLAUDE_WATCH_INGRESS_TOKEN='YOUR_SHARED_BEARER_TOKEN' \
 node server.js
 ```
 
@@ -282,6 +287,7 @@ node server.js
 node server.js \
   --tunnel-enabled true \
   --tunnel-mode token \
+  --ingress-token 'YOUR_SHARED_BEARER_TOKEN' \
   --cf-token 'YOUR_TUNNEL_TOKEN'
 ```
 

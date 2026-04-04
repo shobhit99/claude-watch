@@ -39,6 +39,7 @@ final class BonjourDiscovery: ObservableObject {
 
     @Published private(set) var discoveredServices: [DiscoveredService] = []
     @Published private(set) var isSearching: Bool = false
+    var ingressToken: String?
 
     private var browser: NWBrowser?
     private let queue = DispatchQueue(label: "com.claudewatch.bonjour", qos: .userInitiated)
@@ -71,6 +72,9 @@ final class BonjourDiscovery: ObservableObject {
             let url = URL(string: "http://\(ip):\(port)/status")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 3
+            if let ingressToken, !ingressToken.isEmpty {
+                request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+            }
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 if let http = response as? HTTPURLResponse, http.statusCode == 200 {
@@ -94,6 +98,9 @@ final class BonjourDiscovery: ObservableObject {
             let url = URL(string: "http://127.0.0.1:\(port)/status")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 2
+            if let ingressToken, !ingressToken.isEmpty {
+                request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+            }
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 if let http = response as? HTTPURLResponse, http.statusCode == 200 {
