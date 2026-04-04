@@ -88,6 +88,8 @@ class WatchBridgeClient: ObservableObject {
             UserDefaults.standard.set(result.token, forKey: "watch_bridge_token")
         } else if http.statusCode == 429 {
             throw BridgeError.rateLimited
+        } else if http.statusCode == 404, ingressToken != nil {
+            throw BridgeError.unauthorized
         } else if http.statusCode == 401 {
             let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
             if body?.error.lowercased().contains("unauthorized") == true {

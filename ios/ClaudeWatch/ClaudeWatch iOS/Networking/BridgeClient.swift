@@ -129,6 +129,12 @@ final class BridgeClient {
         case 429:
             throw BridgeError.rateLimited
 
+        case 404:
+            if ingressToken != nil {
+                throw BridgeError.unauthorized
+            }
+            throw BridgeError.serverError("Bridge endpoint not found.")
+
         default:
             let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
             throw BridgeError.serverError(body?.error ?? "Unknown error (HTTP \(httpResponse.statusCode))")
@@ -215,7 +221,16 @@ final class BridgeClient {
         } else if let ingressToken {
             request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
         }
-        let (data, _) = try await performRequest(request)
+        let (data, response) = try await performRequest(request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw BridgeError.networkError
+        }
+        if httpResponse.statusCode == 404, token == nil, ingressToken != nil {
+            throw BridgeError.unauthorized
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw BridgeError.serverError("Bridge status request failed (HTTP \(httpResponse.statusCode))")
+        }
         return try JSONDecoder().decode(BridgeStatus.self, from: data)
     }
 

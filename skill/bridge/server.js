@@ -66,6 +66,13 @@ function parseOptionalString(value) {
   return trimmed.length ? trimmed : null;
 }
 
+function parseOptionalPositiveInt(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
 function expandHomePath(filePath) {
   if (!filePath) return filePath;
   if (filePath === "~") return os.homedir();
@@ -312,6 +319,18 @@ const PORT_RANGE_END = 7869;
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
+const INGRESS_FAIL2BAN_MAX_ATTEMPTS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_MAX_ATTEMPTS),
+  5,
+);
+const INGRESS_FAIL2BAN_WINDOW_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_WINDOW_MS),
+  10 * 60 * 1000,
+);
+const INGRESS_FAIL2BAN_BAN_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_BAN_MS),
+  30 * 60 * 1000,
+);
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
@@ -333,6 +352,8 @@ let pairingCodeExpiresAt = 0;
 // Rate limiting
 let rateLimitAttempts = 0;
 let rateLimitWindowStart = Date.now();
+/** @type {Map<string, {count: number, windowStart: number, bannedUntil: number}>} */
+const ingressAuthFail2ban = new Map();
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
@@ -427,6 +448,25 @@ function extractBearerToken(req) {
   return auth.slice(7);
 }
 
+function normalizeClientIp(rawIp) {
+  const value = parseOptionalString(rawIp);
+  if (!value) return null;
+  const first = value.split(",")[0]?.trim();
+  if (!first) return null;
+  if (first.startsWith("::ffff:")) return first.slice(7);
+  return first;
+}
+
+function getClientIp(req) {
+  return normalizeClientIp(
+    req.headers["cf-connecting-ip"]
+    || req.headers["x-forwarded-for"]
+    || req.headers["x-real-ip"]
+    || req.socket?.remoteAddress
+    || null,
+  );
+}
+
 function requireAuth(req) {
   const token = extractBearerToken(req);
   return token === sessionToken && sessionToken !== null;
@@ -442,6 +482,83 @@ function requireIngressOrSessionAuth(req) {
   const token = extractBearerToken(req);
   if (!token) return false;
   return token === INGRESS_BEARER_TOKEN || (sessionToken !== null && token === sessionToken);
+}
+
+function sendNginxNotFound(res) {
+  const body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+  res.writeHead(404, {
+    "Content-Type": "text/html",
+    "Content-Length": Buffer.byteLength(body),
+    "Server": "nginx",
+  });
+  res.end(body);
+}
+
+function isIngressIpBanned(clientIp) {
+  if (!INGRESS_BEARER_TOKEN || !clientIp) return false;
+  const entry = ingressAuthFail2ban.get(clientIp);
+  if (!entry) return false;
+  if (entry.bannedUntil > Date.now()) {
+    return true;
+  }
+  ingressAuthFail2ban.delete(clientIp);
+  return false;
+}
+
+function clearIngressFail2ban(clientIp) {
+  if (!clientIp) return;
+  ingressAuthFail2ban.delete(clientIp);
+}
+
+function recordIngressAuthFailure(clientIp) {
+  if (!INGRESS_BEARER_TOKEN || !clientIp) return;
+  const now = Date.now();
+  const entry = ingressAuthFail2ban.get(clientIp) || {
+    count: 0,
+    windowStart: now,
+    bannedUntil: 0,
+  };
+
+  if (entry.bannedUntil > now) {
+    ingressAuthFail2ban.set(clientIp, entry);
+    return;
+  }
+
+  if (now - entry.windowStart > INGRESS_FAIL2BAN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  entry.count += 1;
+  if (entry.count >= INGRESS_FAIL2BAN_MAX_ATTEMPTS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.bannedUntil = now + INGRESS_FAIL2BAN_BAN_MS;
+    log("warn", `Ingress fail2ban blocked IP ${clientIp} for ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s due to invalid Bearer token`);
+  }
+
+  ingressAuthFail2ban.set(clientIp, entry);
+}
+
+function enforceIngressProtection(req, res, options = {}) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  const allowSession = options.allowSession === true;
+  const clientIp = getClientIp(req);
+
+  if (isIngressIpBanned(clientIp)) {
+    sendNginxNotFound(res);
+    return false;
+  }
+
+  const authorized = allowSession ? requireIngressOrSessionAuth(req) : requireIngressAuth(req);
+  if (!authorized) {
+    recordIngressAuthFailure(clientIp);
+    sendNginxNotFound(res);
+    return false;
+  }
+
+  clearIngressFail2ban(clientIp);
+  return true;
 }
 
 function jsonResponse(res, status, body) {
@@ -1358,8 +1475,8 @@ async function handlePair(req, res) {
   if (req.method !== "POST") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
-  if (!requireIngressAuth(req)) {
-    return jsonResponse(res, 401, { error: "Unauthorized: missing or invalid ingress Bearer token" });
+  if (!enforceIngressProtection(req, res)) {
+    return;
   }
 
   if (isRateLimited()) {
@@ -1810,8 +1927,8 @@ async function handleHookError(req, res) {
 }
 
 function handleStatus(_req, res) {
-  if (!requireIngressOrSessionAuth(_req)) {
-    return jsonResponse(res, 401, { error: "Unauthorized: missing or invalid Bearer token" });
+  if (!enforceIngressProtection(_req, res, { allowSession: true })) {
+    return;
   }
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
@@ -1970,6 +2087,7 @@ async function startServer() {
   }
   if (INGRESS_BEARER_TOKEN) {
     console.log(`Ingress Bearer Token: ${INGRESS_BEARER_TOKEN}`);
+    console.log(`Ingress Fail2Ban: ${INGRESS_FAIL2BAN_MAX_ATTEMPTS} failures/${Math.ceil(INGRESS_FAIL2BAN_WINDOW_MS / 1000)}s, ban ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s`);
   }
   console.log("");
 
