@@ -7,7 +7,7 @@ struct PairingView: View {
     // MARK: - State
 
     @State private var code: String = ""
-    @State private var ipAddress: String = ""
+    @State private var endpoint: String = ""
     @State private var showManualIP: Bool = false
     @FocusState private var isCodeFocused: Bool
     @FocusState private var isIPFocused: Bool
@@ -55,7 +55,7 @@ struct PairingView: View {
                 .foregroundStyle(Color.claudeOrange)
 
             Text(showManualIP
-                 ? "Enter your Mac's IP and the pairing code"
+                 ? "输入桥接地址和配对码"
                  : "Enter the pairing code from your Mac")
                 .font(.system(size: 15))
                 .foregroundStyle(Color.subtleText)
@@ -65,8 +65,8 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("192.168.1.x", text: $ipAddress)
-                .keyboardType(.decimalPad)
+            TextField("https://xxx.trycloudflare.com 或 192.168.1.x", text: $endpoint)
+                .keyboardType(.URL)
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
                 .tint(Color.claudeOrange)
@@ -153,7 +153,7 @@ struct PairingView: View {
                         isIPFocused = true
                     }
                 } label: {
-                    Text("Can't connect? Enter IP manually")
+                    Text("无法自动连接？手动输入地址")
                         .font(.system(size: 13))
                         .foregroundStyle(Color.claudeOrange)
                 }
@@ -200,14 +200,14 @@ struct PairingView: View {
         Task {
             do {
                 if showManualIP {
-                    let ip = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !ip.isEmpty else {
+                    let input = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !input.isEmpty else {
                         await MainActor.run {
-                            showPairingError("Please enter your Mac's IP address.")
+                            showPairingError("请输入桥接地址（IP 或 URL）。")
                         }
                         return
                     }
-                    try await relayService.pairWithIP(ip, code: code)
+                    try await relayService.pairWithEndpoint(input, code: code)
                 } else {
                     try await relayService.pair(code: code)
                 }
@@ -219,10 +219,10 @@ struct PairingView: View {
                     // If auto-discovery failed, suggest manual IP
                     if msg.contains("noServiceFound") || msg.contains("timed out") || msg.contains("not found") {
                         showManualIP = true
-                        showPairingError("Bridge not found automatically. Enter your Mac's IP address.")
+                        showPairingError("未自动发现桥接服务，请输入 IP 或完整 URL。")
                         isIPFocused = true
                     } else {
-                        showPairingError("Connection failed: \(msg)")
+                        showPairingError("连接失败：\(msg)")
                     }
                 }
             }
@@ -241,10 +241,10 @@ struct PairingView: View {
         case .networkError:
             if !showManualIP {
                 showManualIP = true
-                showPairingError("Can't reach bridge. Enter your Mac's IP address.")
+                showPairingError("无法连接桥接服务，请输入 IP 或完整 URL。")
                 isIPFocused = true
             } else {
-                showPairingError("Cannot reach the bridge server. Check the IP and network.")
+                showPairingError("无法连接桥接服务，请检查地址与网络。")
             }
         case .serverError(let msg):
             showPairingError(msg)
@@ -259,7 +259,7 @@ struct PairingView: View {
         }
         code = ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if showManualIP && ipAddress.isEmpty {
+            if showManualIP && endpoint.isEmpty {
                 isIPFocused = true
             } else {
                 isCodeFocused = true

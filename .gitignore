@@ -16,3 +16,6 @@
 *.swp
 *.swo
 *~
+
+# 本地桥接配置（可能包含隧道 token）
+skill/bridge/bridge.config.json

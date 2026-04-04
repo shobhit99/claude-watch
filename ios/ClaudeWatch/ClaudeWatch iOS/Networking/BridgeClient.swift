@@ -49,8 +49,14 @@ final class BridgeClient {
 
     func configure(host: String, port: UInt16) {
         let urlString = "http://\(host):\(port)"
-        self.baseURL = URL(string: urlString)
-        UserDefaults.standard.set(urlString, forKey: "bridge_url")
+        guard let url = URL(string: urlString) else { return }
+        configure(baseURL: url)
+    }
+
+    func configure(baseURL: URL) {
+        guard let normalized = normalizedBaseURL(from: baseURL) else { return }
+        self.baseURL = normalized
+        UserDefaults.standard.set(normalized.absoluteString, forKey: "bridge_url")
     }
 
     var isPaired: Bool {
@@ -240,6 +246,20 @@ final class BridgeClient {
         }
     }
 
+    private func normalizedBaseURL(from url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        let scheme = (components.scheme ?? "").lowercased()
+        guard scheme == "http" || scheme == "https", components.host != nil else {
+            return nil
+        }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
     // MARK: - Response types
 
     private struct PairResponse: Decodable {
@@ -264,6 +284,19 @@ final class BridgeClient {
         let sseClients: Int
         let pendingPermissions: Int
         let eventBufferSize: Int
+        let localEndpoint: String?
+        let publicEndpoint: String?
+        let tunnel: TunnelInfo?
+    }
+
+    struct TunnelInfo: Decodable {
+        let enabled: Bool
+        let provider: String
+        let mode: String
+        let status: String
+        let localUrl: String?
+        let publicUrl: String?
+        let error: String?
     }
 
     struct BridgeSessionInfo: Decodable {

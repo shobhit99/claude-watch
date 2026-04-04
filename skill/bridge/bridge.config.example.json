@@ -1,0 +1,9 @@
+{
+  "tunnel": {
+    "enabled": false,
+    "mode": "quick",
+    "token": "",
+    "publicUrl": "",
+    "cloudflaredBin": ""
+  }
+}

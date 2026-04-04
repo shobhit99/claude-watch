@@ -5,7 +5,7 @@ struct OnboardingView: View {
     @StateObject private var bridge = WatchBridgeClient.shared
 
     @State private var code = ""
-    @State private var ipAddress = ""
+    @State private var endpointInput = ""
     @State private var isSearching = false
     @State private var isConnecting = false
     @State private var error: String?
@@ -58,15 +58,15 @@ struct OnboardingView: View {
 
             } else {
                 // Not found — IP entry right away
-                Text("Enter Mac IP")
+                Text("输入桥接地址")
                     .font(.system(size: 11))
                     .foregroundColor(Theme.Text.secondary)
 
-                Text("Wi-Fi not required — routes via iPhone")
+                Text("支持 IP 或完整 URL")
                     .font(.system(size: 9))
                     .foregroundColor(Theme.Text.dimmed)
 
-                TextField("192.168.1.x", text: $ipAddress)
+                TextField("https://xxx.trycloudflare.com 或 192.168.1.x", text: $endpointInput)
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                     .foregroundColor(Theme.Text.primary)
                     .multilineTextAlignment(.center)
@@ -82,7 +82,7 @@ struct OnboardingView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
-                .disabled(ipAddress.isEmpty)
+                .disabled(endpointInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 Button("Retry auto") { searchForBridge() }
                     .font(.system(size: 10))
@@ -106,32 +106,96 @@ struct OnboardingView: View {
     }
 
     private func connectManual() {
-        let ip = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !ip.isEmpty else { return }
+        let input = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
         isSearching = true
         error = nil
 
         Task {
-            for port in 7860...7869 {
-                let url = URL(string: "http://\(ip):\(port)/status")!
-                var request = URLRequest(url: url)
+            if let directURL = normalizedEndpointURL(input) {
+                let statusURL = directURL.appendingPathComponent("status")
+                var request = URLRequest(url: statusURL)
                 request.timeoutInterval = 3
                 do {
                     let (_, response) = try await URLSession.shared.data(for: request)
                     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                         await MainActor.run {
                             isSearching = false
-                            bridgeURL = URL(string: "http://\(ip):\(port)")
+                            bridgeURL = directURL
                             codeFocused = true
                         }
                         return
                     }
-                } catch { continue }
+                } catch {
+                    // ignore and fallback to error
+                }
+            } else {
+                for port in 7860...7869 {
+                    let url = URL(string: "http://\(input):\(port)/status")!
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 3
+                    do {
+                        let (_, response) = try await URLSession.shared.data(for: request)
+                        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                            await MainActor.run {
+                                isSearching = false
+                                bridgeURL = URL(string: "http://\(input):\(port)")
+                                codeFocused = true
+                            }
+                            return
+                        }
+                    } catch { continue }
+                }
             }
             await MainActor.run {
                 isSearching = false
-                self.error = "Can't reach \(ip)"
+                self.error = "无法连接：\(input)"
             }
+        }
+    }
+
+    private func normalizedEndpointURL(_ input: String) -> URL? {
+        if let url = URL(string: input),
+           let scheme = url.scheme?.lowercased(),
+           (scheme == "http" || scheme == "https"),
+           url.host != nil {
+            return stripPath(from: url)
+        }
+
+        if input.contains("://") {
+            return nil
+        }
+
+        if input.contains(":"),
+           let httpURL = URL(string: "http://\(input)"),
+           httpURL.host != nil {
+            return stripPath(from: httpURL)
+        }
+
+        if input.contains("."),
+           !isLikelyIPv4(input),
+           let httpsURL = URL(string: "https://\(input)"),
+           httpsURL.host != nil {
+            return stripPath(from: httpsURL)
+        }
+
+        return nil
+    }
+
+    private func stripPath(from url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    private func isLikelyIPv4(_ value: String) -> Bool {
+        let segments = value.split(separator: ".")
+        guard segments.count == 4 else { return false }
+        return segments.allSatisfy { seg in
+            guard let num = Int(seg), (0...255).contains(num) else { return false }
+            return true
         }
     }
 
@@ -164,7 +228,7 @@ struct OnboardingView: View {
                         machineName: "Mac", modelName: nil,
                         workingDirectory: nil,
                         elapsedSeconds: 0, filesChanged: 0, linesAdded: 0,
-                        transportMode: .lan
+                        transportMode: transportMode(for: url)
                     )
                     session.appendLine(TerminalLine(text: "Connected to bridge", type: .system))
                     session.startEventStream()
@@ -177,6 +241,22 @@ struct OnboardingView: View {
                 }
             }
         }
+    }
+
+    private func transportMode(for url: URL) -> SessionState.TransportMode {
+        guard let host = url.host?.lowercased() else { return .lan }
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return .lan
+        }
+        if isLikelyIPv4(host) {
+            let parts = host.split(separator: ".").compactMap { Int($0) }
+            if parts.count == 4 {
+                if parts[0] == 10 { return .lan }
+                if parts[0] == 192 && parts[1] == 168 { return .lan }
+                if parts[0] == 172 && (16...31).contains(parts[1]) { return .lan }
+            }
+        }
+        return .remote
     }
 }
 
