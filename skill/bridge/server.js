@@ -331,6 +331,18 @@ const INGRESS_FAIL2BAN_BAN_MS = firstDefined(
   parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_BAN_MS),
   30 * 60 * 1000,
 );
+const NON_PAIR_FAIL2BAN_MAX_ATTEMPTS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_MAX_ATTEMPTS),
+  15,
+);
+const NON_PAIR_FAIL2BAN_WINDOW_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_WINDOW_MS),
+  10 * 60 * 1000,
+);
+const NON_PAIR_FAIL2BAN_BAN_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_BAN_MS),
+  30 * 60 * 1000,
+);
 const INGRESS_FAIL2BAN_UNKNOWN_KEY = "__unknown__";
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
@@ -355,6 +367,8 @@ let rateLimitAttempts = 0;
 let rateLimitWindowStart = Date.now();
 /** @type {Map<string, {count: number, windowStart: number, bannedUntil: number}>} */
 const ingressAuthFail2ban = new Map();
+/** @type {Map<string, {count: number, windowStart: number, bannedUntil: number}>} */
+const nonPairFail2ban = new Map();
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
@@ -570,6 +584,54 @@ function enforceIngressProtection(req, res, options = {}) {
     clearIngressFail2ban(clientKey);
   }
   return true;
+}
+
+function isNonPairBanned(clientKey) {
+  if (!clientKey) return false;
+  const entry = nonPairFail2ban.get(clientKey);
+  if (!entry) return false;
+  if (entry.bannedUntil <= 0) return false;
+  if (entry.bannedUntil > Date.now()) {
+    return true;
+  }
+  nonPairFail2ban.delete(clientKey);
+  return false;
+}
+
+function clearNonPairFailures(clientKey) {
+  if (!clientKey) return;
+  nonPairFail2ban.delete(clientKey);
+}
+
+function recordNonPairFailure(clientKey, clientIp = null, reason = "") {
+  if (!clientKey) return;
+  const now = Date.now();
+  const entry = nonPairFail2ban.get(clientKey) || {
+    count: 0,
+    windowStart: now,
+    bannedUntil: 0,
+  };
+
+  if (entry.bannedUntil > now) {
+    nonPairFail2ban.set(clientKey, entry);
+    return;
+  }
+
+  if (now - entry.windowStart > NON_PAIR_FAIL2BAN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  entry.count += 1;
+  if (entry.count >= NON_PAIR_FAIL2BAN_MAX_ATTEMPTS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.bannedUntil = now + NON_PAIR_FAIL2BAN_BAN_MS;
+    const identity = clientIp || clientKey;
+    log("warn", `Non-pair fail2ban blocked client ${identity} for ${Math.ceil(NON_PAIR_FAIL2BAN_BAN_MS / 1000)}s (${reason || "repeated endpoint probing"})`);
+  }
+
+  nonPairFail2ban.set(clientKey, entry);
 }
 
 function jsonResponse(res, status, body) {
@@ -1539,8 +1601,10 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
   if (!requireAuth(req)) {
+    recordNonPairFailure(getIngressFail2banKey(req), getClientIp(req), "unauthorized /command");
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+  clearNonPairFailures(getIngressFail2banKey(req));
 
   let body;
   try {
@@ -1709,8 +1773,10 @@ function handleEvents(req, res) {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
   if (!requireAuth(req)) {
+    recordNonPairFailure(getIngressFail2banKey(req), getClientIp(req), "unauthorized /events");
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+  clearNonPairFailures(getIngressFail2banKey(req));
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -1980,6 +2046,12 @@ const routes = {
 async function onRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const routeKey = `${req.method} ${url.pathname}`;
+  const clientKey = getIngressFail2banKey(req);
+  const clientIp = getClientIp(req);
+
+  if (url.pathname !== "/pair" && isNonPairBanned(clientKey)) {
+    return sendNginxNotFound(res);
+  }
 
   const handler = routes[routeKey];
   if (handler) {
@@ -1992,6 +2064,10 @@ async function onRequest(req, res) {
       }
     }
   } else {
+    if (url.pathname !== "/pair") {
+      recordNonPairFailure(clientKey, clientIp, `unknown route ${routeKey}`);
+      return sendNginxNotFound(res);
+    }
     jsonResponse(res, 404, { error: "Not found" });
   }
 }
@@ -2100,6 +2176,7 @@ async function startServer() {
     console.log(`Ingress Bearer Token: ${INGRESS_BEARER_TOKEN}`);
     console.log(`Ingress Fail2Ban: ${INGRESS_FAIL2BAN_MAX_ATTEMPTS} failures/${Math.ceil(INGRESS_FAIL2BAN_WINDOW_MS / 1000)}s, ban ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s`);
   }
+  console.log(`Endpoint Fail2Ban (except /pair): ${NON_PAIR_FAIL2BAN_MAX_ATTEMPTS} failures/${Math.ceil(NON_PAIR_FAIL2BAN_WINDOW_MS / 1000)}s, ban ${Math.ceil(NON_PAIR_FAIL2BAN_BAN_MS / 1000)}s`);
   console.log("");
 
   // --- Graceful shutdown ---

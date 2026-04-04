@@ -337,3 +337,55 @@ test("events endpoint requires session token and responds as SSE", async (t) => 
   assert.match(sseRes.headers.get("content-type") ?? "", /text\/event-stream/);
   await sseRes.body?.cancel();
 });
+
+test("non-/pair auth brute force on /command triggers in-memory IP ban", async (t) => {
+  const bridge = await startBridgeServer({
+    CLAUDE_WATCH_INGRESS_TOKEN: "test_ingress_token",
+    CLAUDE_WATCH_INGRESS_FAIL2BAN_MAX_ATTEMPTS: "20",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_MAX_ATTEMPTS: "3",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_WINDOW_MS: "600000",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_BAN_MS: "600000",
+  });
+  t.after(async () => {
+    await stopProcess(bridge.child);
+  });
+
+  for (let i = 0; i < 3; i++) {
+    const unauthorized = await requestBridge(bridge.baseURL, "/command", {
+      method: "POST",
+      token: `invalid_session_${i}`,
+      json: { command: "echo test" },
+    });
+    assert.equal(unauthorized.res.status, 401);
+  }
+
+  const blockedStatus = await requestBridge(bridge.baseURL, "/status", {
+    token: "test_ingress_token",
+  });
+  assert.equal(blockedStatus.res.status, 404);
+  assert.match(bridge.logsRef(), /Non-pair fail2ban blocked client/);
+});
+
+test("unknown-route probing also contributes to non-/pair IP ban", async (t) => {
+  const bridge = await startBridgeServer({
+    CLAUDE_WATCH_INGRESS_TOKEN: "test_ingress_token",
+    CLAUDE_WATCH_INGRESS_FAIL2BAN_MAX_ATTEMPTS: "20",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_MAX_ATTEMPTS: "2",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_WINDOW_MS: "600000",
+    CLAUDE_WATCH_NON_PAIR_FAIL2BAN_BAN_MS: "600000",
+  });
+  t.after(async () => {
+    await stopProcess(bridge.child);
+  });
+
+  const probe1 = await requestBridge(bridge.baseURL, "/wp-admin");
+  assert.equal(probe1.res.status, 404);
+
+  const probe2 = await requestBridge(bridge.baseURL, "/.env");
+  assert.equal(probe2.res.status, 404);
+
+  const blockedStatus = await requestBridge(bridge.baseURL, "/status", {
+    token: "test_ingress_token",
+  });
+  assert.equal(blockedStatus.res.status, 404);
+});

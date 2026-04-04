@@ -291,6 +291,20 @@ node server.js \
   --cf-token 'YOUR_TUNNEL_TOKEN'
 ```
 
+### In-memory scanner / brute-force protection (optional)
+
+In addition to ingress auth protection, the bridge tracks repeated probing on non-`/pair` endpoints
+(such as invalid session token bursts on `/command`/`/events`, or repeated unknown-route scans).
+When the threshold is reached, that client IP is temporarily blocked in memory.
+
+Tune with environment variables:
+
+```bash
+CLAUDE_WATCH_NON_PAIR_FAIL2BAN_MAX_ATTEMPTS=15
+CLAUDE_WATCH_NON_PAIR_FAIL2BAN_WINDOW_MS=600000
+CLAUDE_WATCH_NON_PAIR_FAIL2BAN_BAN_MS=1800000
+```
+
 ### Removing Hooks
 
 ```bash
