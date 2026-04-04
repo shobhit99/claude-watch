@@ -331,6 +331,7 @@ const INGRESS_FAIL2BAN_BAN_MS = firstDefined(
   parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_BAN_MS),
   30 * 60 * 1000,
 );
+const INGRESS_FAIL2BAN_UNKNOWN_KEY = "__unknown__";
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
@@ -467,6 +468,10 @@ function getClientIp(req) {
   );
 }
 
+function getIngressFail2banKey(req) {
+  return getClientIp(req) || INGRESS_FAIL2BAN_UNKNOWN_KEY;
+}
+
 function requireAuth(req) {
   const token = extractBearerToken(req);
   return token === sessionToken && sessionToken !== null;
@@ -494,33 +499,34 @@ function sendNginxNotFound(res) {
   res.end(body);
 }
 
-function isIngressIpBanned(clientIp) {
-  if (!INGRESS_BEARER_TOKEN || !clientIp) return false;
-  const entry = ingressAuthFail2ban.get(clientIp);
+function isIngressIpBanned(clientKey) {
+  if (!INGRESS_BEARER_TOKEN || !clientKey) return false;
+  const entry = ingressAuthFail2ban.get(clientKey);
   if (!entry) return false;
+  if (entry.bannedUntil <= 0) return false;
   if (entry.bannedUntil > Date.now()) {
     return true;
   }
-  ingressAuthFail2ban.delete(clientIp);
+  ingressAuthFail2ban.delete(clientKey);
   return false;
 }
 
-function clearIngressFail2ban(clientIp) {
-  if (!clientIp) return;
-  ingressAuthFail2ban.delete(clientIp);
+function clearIngressFail2ban(clientKey) {
+  if (!clientKey) return;
+  ingressAuthFail2ban.delete(clientKey);
 }
 
-function recordIngressAuthFailure(clientIp) {
-  if (!INGRESS_BEARER_TOKEN || !clientIp) return;
+function recordIngressAuthFailure(clientKey, clientIp = null) {
+  if (!INGRESS_BEARER_TOKEN || !clientKey) return;
   const now = Date.now();
-  const entry = ingressAuthFail2ban.get(clientIp) || {
+  const entry = ingressAuthFail2ban.get(clientKey) || {
     count: 0,
     windowStart: now,
     bannedUntil: 0,
   };
 
   if (entry.bannedUntil > now) {
-    ingressAuthFail2ban.set(clientIp, entry);
+    ingressAuthFail2ban.set(clientKey, entry);
     return;
   }
 
@@ -534,30 +540,35 @@ function recordIngressAuthFailure(clientIp) {
     entry.count = 0;
     entry.windowStart = now;
     entry.bannedUntil = now + INGRESS_FAIL2BAN_BAN_MS;
-    log("warn", `Ingress fail2ban blocked IP ${clientIp} for ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s due to invalid Bearer token`);
+    const identity = clientIp || clientKey;
+    log("warn", `Ingress fail2ban blocked client ${identity} for ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s due to invalid Bearer token`);
   }
 
-  ingressAuthFail2ban.set(clientIp, entry);
+  ingressAuthFail2ban.set(clientKey, entry);
 }
 
 function enforceIngressProtection(req, res, options = {}) {
   if (!INGRESS_BEARER_TOKEN) return true;
   const allowSession = options.allowSession === true;
   const clientIp = getClientIp(req);
+  const clientKey = getIngressFail2banKey(req);
 
-  if (isIngressIpBanned(clientIp)) {
+  if (isIngressIpBanned(clientKey)) {
     sendNginxNotFound(res);
     return false;
   }
 
   const authorized = allowSession ? requireIngressOrSessionAuth(req) : requireIngressAuth(req);
   if (!authorized) {
-    recordIngressAuthFailure(clientIp);
+    recordIngressAuthFailure(clientKey, clientIp);
     sendNginxNotFound(res);
     return false;
   }
 
-  clearIngressFail2ban(clientIp);
+  const ingressToken = extractBearerToken(req);
+  if (ingressToken === INGRESS_BEARER_TOKEN) {
+    clearIngressFail2ban(clientKey);
+  }
   return true;
 }
 
