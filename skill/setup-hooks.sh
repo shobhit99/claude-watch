@@ -186,6 +186,7 @@ if command -v codex &>/dev/null; then
   # Codex doesn't have HTTP hooks like Claude Code.
   # Instead, create a wrapper script that pipes --json events to the bridge.
   WRAPPER="$HOME/.local/bin/codex-watch"
+  mkdir -p "$(dirname "$WRAPPER")"
 
   cat > "$WRAPPER" << 'WRAPPER_EOF'
 #!/bin/bash
