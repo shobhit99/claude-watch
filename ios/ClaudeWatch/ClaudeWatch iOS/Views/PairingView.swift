@@ -7,7 +7,7 @@ struct PairingView: View {
     // MARK: - State
 
     @State private var code: String = ""
-    @State private var ipAddress: String = ""
+    @State private var endpoint: String = ""
     @State private var showManualIP: Bool = false
     @FocusState private var isCodeFocused: Bool
     @FocusState private var isIPFocused: Bool
@@ -15,6 +15,7 @@ struct PairingView: View {
     @State private var showError: Bool = false
     @State private var errorMessage: String = ""
     @State private var isConnecting: Bool = false
+    @State private var ingressToken: String = UserDefaults.standard.string(forKey: "bridge_ingress_token") ?? ""
 
     // MARK: - Body
 
@@ -55,7 +56,7 @@ struct PairingView: View {
                 .foregroundStyle(Color.claudeOrange)
 
             Text(showManualIP
-                 ? "Enter your Mac's IP and the pairing code"
+                 ? "Enter your bridge endpoint and pairing code"
                  : "Enter the pairing code from your Mac")
                 .font(.system(size: 15))
                 .foregroundStyle(Color.subtleText)
@@ -65,8 +66,8 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("192.168.1.x", text: $ipAddress)
-                .keyboardType(.decimalPad)
+            TextField("https://xxx.trycloudflare.com or 192.168.1.x", text: $endpoint)
+                .keyboardType(.URL)
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
                 .tint(Color.claudeOrange)
@@ -153,11 +154,26 @@ struct PairingView: View {
                         isIPFocused = true
                     }
                 } label: {
-                    Text("Can't connect? Enter IP manually")
+                    Text("Can't connect? Enter endpoint manually")
                         .font(.system(size: 13))
                         .foregroundStyle(Color.claudeOrange)
                 }
             }
+
+            SecureField("Ingress Bearer token (optional)", text: $ingressToken)
+                .textContentType(.password)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(.white)
+                .tint(Color.claudeOrange)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.cardBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.fieldBorder, lineWidth: 1)
+                )
 
             Text("Run `node server.js` in the bridge folder to start")
                 .font(.system(size: 13, design: .monospaced))
@@ -196,18 +212,19 @@ struct PairingView: View {
         isConnecting = true
         isCodeFocused = false
         isIPFocused = false
+        relayService.setIngressToken(ingressToken)
 
         Task {
             do {
                 if showManualIP {
-                    let ip = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !ip.isEmpty else {
+                    let input = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !input.isEmpty else {
                         await MainActor.run {
-                            showPairingError("Please enter your Mac's IP address.")
+                            showPairingError("Please enter a bridge endpoint (IP or URL).")
                         }
                         return
                     }
-                    try await relayService.pairWithIP(ip, code: code)
+                    try await relayService.pairWithEndpoint(input, code: code)
                 } else {
                     try await relayService.pair(code: code)
                 }
@@ -219,7 +236,7 @@ struct PairingView: View {
                     // If auto-discovery failed, suggest manual IP
                     if msg.contains("noServiceFound") || msg.contains("timed out") || msg.contains("not found") {
                         showManualIP = true
-                        showPairingError("Bridge not found automatically. Enter your Mac's IP address.")
+                        showPairingError("Bridge not found automatically. Enter IP or full URL.")
                         isIPFocused = true
                     } else {
                         showPairingError("Connection failed: \(msg)")
@@ -238,13 +255,15 @@ struct PairingView: View {
             showPairingError("Code expired. A new code has been generated on your Mac.")
         case .rateLimited:
             showPairingError("Too many attempts. Please wait a few minutes.")
+        case .unauthorized:
+            showPairingError("Authorization failed. Check your Ingress Bearer token.")
         case .networkError:
             if !showManualIP {
                 showManualIP = true
-                showPairingError("Can't reach bridge. Enter your Mac's IP address.")
+                showPairingError("Can't reach bridge. Enter IP or full URL.")
                 isIPFocused = true
             } else {
-                showPairingError("Cannot reach the bridge server. Check the IP and network.")
+                showPairingError("Cannot reach bridge server. Check endpoint and network.")
             }
         case .serverError(let msg):
             showPairingError(msg)
@@ -259,7 +278,7 @@ struct PairingView: View {
         }
         code = ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if showManualIP && ipAddress.isEmpty {
+            if showManualIP && endpoint.isEmpty {
                 isIPFocused = true
             } else {
                 isCodeFocused = true

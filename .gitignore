@@ -16,3 +16,6 @@
 *.swp
 *.swo
 *~
+
+# Local bridge config (may contain tunnel tokens)
+skill/bridge/bridge.config.json

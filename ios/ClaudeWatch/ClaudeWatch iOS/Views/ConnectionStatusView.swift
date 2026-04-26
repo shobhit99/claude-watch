@@ -88,16 +88,30 @@ struct ConnectionStatusView: View {
     private var connectionBadge: some View {
         HStack(spacing: 4) {
             Circle()
-                .fill(Color.statusGreen)
+                .fill(connectionBadgeColor)
                 .frame(width: 6, height: 6)
-            Text("LAN")
+            Text(connectionBadgeText)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color.statusGreen)
+                .foregroundStyle(connectionBadgeColor)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
         .background(Color.connectedPillBackground)
         .clipShape(Capsule())
+    }
+
+    private var connectionBadgeText: String {
+        switch relayService.transportMode {
+        case .lan: return "LAN"
+        case .remote: return "REMOTE"
+        }
+    }
+
+    private var connectionBadgeColor: Color {
+        switch relayService.transportMode {
+        case .lan: return Color.statusGreen
+        case .remote: return Color.claudeOrange
+        }
     }
 
     // MARK: - Waiting for sessions

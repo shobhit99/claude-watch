@@ -7,6 +7,7 @@ class WatchBridgeClient: ObservableObject {
 
     @Published var baseURL: URL?
     @Published var token: String?
+    @Published var ingressToken: String?
 
     var isPaired: Bool { token != nil && baseURL != nil }
 
@@ -22,6 +23,7 @@ class WatchBridgeClient: ObservableObject {
             baseURL = URL(string: url)
         }
         token = UserDefaults.standard.string(forKey: "watch_bridge_token")
+        ingressToken = UserDefaults.standard.string(forKey: "watch_bridge_ingress_token")
     }
 
     /// Discover bridge via Bonjour on LAN, fallback to localhost (simulator)
@@ -51,6 +53,9 @@ class WatchBridgeClient: ObservableObject {
             let url = URL(string: "http://127.0.0.1:\(port)/status")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 2
+            if let ingressToken, !ingressToken.isEmpty {
+                request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+            }
             do {
                 let (_, response) = try await session.data(for: request)
                 if let http = response as? HTTPURLResponse, http.statusCode == 200 {
@@ -67,6 +72,9 @@ class WatchBridgeClient: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let ingressToken, !ingressToken.isEmpty {
+            request.setValue("Bearer \(ingressToken)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = try JSONEncoder().encode(["code": code])
 
         let (data, response) = try await session.data(for: request)
@@ -80,6 +88,14 @@ class WatchBridgeClient: ObservableObject {
             UserDefaults.standard.set(result.token, forKey: "watch_bridge_token")
         } else if http.statusCode == 429 {
             throw BridgeError.rateLimited
+        } else if http.statusCode == 404, ingressToken != nil {
+            throw BridgeError.unauthorized
+        } else if http.statusCode == 401 {
+            let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            if body?.error.lowercased().contains("unauthorized") == true {
+                throw BridgeError.unauthorized
+            }
+            throw BridgeError.invalidCode
         } else {
             throw BridgeError.invalidCode
         }
@@ -103,18 +119,33 @@ class WatchBridgeClient: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "watch_bridge_token")
     }
 
+    func setIngressToken(_ token: String?) {
+        let trimmed = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ingressToken = trimmed.isEmpty ? nil : trimmed
+        if let ingressToken {
+            UserDefaults.standard.set(ingressToken, forKey: "watch_bridge_ingress_token")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "watch_bridge_ingress_token")
+        }
+    }
+
     // MARK: - Types
 
     enum BridgeError: LocalizedError {
-        case network, invalidCode, rateLimited, notPaired
+        case network, invalidCode, rateLimited, unauthorized, notPaired
         var errorDescription: String? {
             switch self {
             case .network: return "Can't reach bridge"
             case .invalidCode: return "Wrong code"
             case .rateLimited: return "Too many attempts"
+            case .unauthorized: return "Bearer token invalid or missing"
             case .notPaired: return "Not paired"
             }
         }
+    }
+
+    struct ErrorResponse: Decodable {
+        let error: String
     }
 
     struct PairResponse: Decodable {

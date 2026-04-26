@@ -24,6 +24,7 @@ final class RelayService: ObservableObject {
     @Published private(set) var elapsedSeconds: Int = 0
     @Published private(set) var recentTerminalLines: [TerminalLine] = []
     @Published private(set) var connectionState: ConnectionState = .disconnected
+    @Published private(set) var transportMode: SessionState.TransportMode = .lan
     @Published private(set) var lastConnected: Date?
     @Published private(set) var isThinking: Bool = false
 
@@ -54,12 +55,19 @@ final class RelayService: ObservableObject {
 
     private init() {
         isPaired = bridgeClient.isPaired
+        transportMode = inferTransportMode(from: bridgeClient.baseURL)
+        discovery.ingressToken = bridgeClient.ingressToken
         setupWatchMessageHandler()
         setupSSEEventHandler()
 
         if isPaired {
             Task { await reconnect() }
         }
+    }
+
+    func setIngressToken(_ token: String?) {
+        bridgeClient.configureIngressToken(token)
+        discovery.ingressToken = bridgeClient.ingressToken
     }
 
     // MARK: - Pairing
@@ -90,25 +98,28 @@ final class RelayService: ObservableObject {
             throw error
         }
 
-        // Success
-        machineName = service.machineName
-        lastConnected = Date()
-        isPaired = true
-        connectionState = .connected
+        finalizePairing(machineName: service.machineName, host: service.host, port: Int(service.port))
+    }
 
-        UserDefaults.standard.set(service.host, forKey: "bridge_host")
-        UserDefaults.standard.set(Int(service.port), forKey: "bridge_port")
-        UserDefaults.standard.set(service.machineName, forKey: "paired_machine_name")
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
+    /// Pairs using a manual endpoint.
+    /// Supports a full URL (https://...) or a plain IP/host (auto-scans 7860-7869).
+    func pairWithEndpoint(_ endpoint: String, code: String) async throws {
+        let input = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { throw BridgeClient.BridgeError.networkError }
 
-        print("[RelayService] isPaired = true, starting event stream")
+        if let directURL = normalizeEndpointURL(input) {
+            print("[RelayService] Manual URL pair: \(directURL.absoluteString)")
+            bridgeClient.configure(baseURL: directURL)
+            try await bridgeClient.pair(code: code)
+            finalizePairing(
+                machineName: directURL.host ?? "Remote Bridge",
+                host: directURL.host,
+                port: directURL.port
+            )
+            return
+        }
 
-        // Start SSE connection
-        startEventStream()
-        startElapsedTimer()
-
-        // Notify watch of connection
-        updateWatchState()
+        try await pairWithIP(input, code: code)
     }
 
     /// Pairs using a manual IP address (fallback when Bonjour fails on real devices).
@@ -119,20 +130,7 @@ final class RelayService: ObservableObject {
         bridgeClient.configure(host: service.host, port: service.port)
 
         try await bridgeClient.pair(code: code)
-
-        machineName = service.machineName
-        lastConnected = Date()
-        isPaired = true
-        connectionState = .connected
-
-        UserDefaults.standard.set(service.host, forKey: "bridge_host")
-        UserDefaults.standard.set(Int(service.port), forKey: "bridge_port")
-        UserDefaults.standard.set(service.machineName, forKey: "paired_machine_name")
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
-
-        startEventStream()
-        startElapsedTimer()
-        updateWatchState()
+        finalizePairing(machineName: service.machineName, host: service.host, port: Int(service.port))
     }
 
     /// Removes pairing and disconnects.
@@ -150,6 +148,7 @@ final class RelayService: ObservableObject {
         elapsedSeconds = 0
         recentTerminalLines = []
         connectionState = .disconnected
+        transportMode = .lan
 
         UserDefaults.standard.removeObject(forKey: "paired_machine_name")
         UserDefaults.standard.removeObject(forKey: "last_connected")
@@ -165,6 +164,7 @@ final class RelayService: ObservableObject {
         guard bridgeClient.isPaired else { return }
 
         machineName = UserDefaults.standard.string(forKey: "paired_machine_name")
+        transportMode = inferTransportMode(from: bridgeClient.baseURL)
         if let ts = UserDefaults.standard.object(forKey: "last_connected") as? TimeInterval {
             lastConnected = Date(timeIntervalSince1970: ts)
         }
@@ -172,6 +172,86 @@ final class RelayService: ObservableObject {
         connectionState = .connecting
         startEventStream()
         startElapsedTimer()
+    }
+
+    private func finalizePairing(machineName: String?, host: String?, port: Int?) {
+        self.machineName = machineName
+        lastConnected = Date()
+        isPaired = true
+        connectionState = .connected
+        transportMode = inferTransportMode(from: bridgeClient.baseURL)
+
+        if let host {
+            UserDefaults.standard.set(host, forKey: "bridge_host")
+        }
+        if let port {
+            UserDefaults.standard.set(port, forKey: "bridge_port")
+        }
+        UserDefaults.standard.set(machineName, forKey: "paired_machine_name")
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
+
+        startEventStream()
+        startElapsedTimer()
+        updateWatchState()
+    }
+
+    private func normalizeEndpointURL(_ endpoint: String) -> URL? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+
+        if let url = URL(string: trimmed),
+           let scheme = url.scheme?.lowercased(),
+           (scheme == "http" || scheme == "https"),
+           url.host != nil {
+            return url
+        }
+
+        if trimmed.contains("://") {
+            return nil
+        }
+
+        if isLikelyIPv4(trimmed) {
+            return nil
+        }
+
+        if trimmed.contains(":"),
+           let httpURL = URL(string: "http://\(trimmed)"),
+           httpURL.host != nil {
+            return httpURL
+        }
+
+        if trimmed.contains("."),
+           let httpsURL = URL(string: "https://\(trimmed)"),
+           httpsURL.host != nil {
+            return httpsURL
+        }
+
+        return nil
+    }
+
+    private func inferTransportMode(from baseURL: URL?) -> SessionState.TransportMode {
+        guard let host = baseURL?.host?.lowercased() else { return .lan }
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return .lan
+        }
+        if isLikelyIPv4(host) {
+            let parts = host.split(separator: ".").compactMap { Int($0) }
+            if parts.count == 4 {
+                if parts[0] == 10 { return .lan }
+                if parts[0] == 192 && parts[1] == 168 { return .lan }
+                if parts[0] == 172 && (16...31).contains(parts[1]) { return .lan }
+            }
+        }
+        return .remote
+    }
+
+    private func isLikelyIPv4(_ value: String) -> Bool {
+        let segments = value.split(separator: ".")
+        guard segments.count == 4 else { return false }
+        return segments.allSatisfy { seg in
+            guard let num = Int(seg), (0...255).contains(num) else { return false }
+            return true
+        }
     }
 
     // MARK: - SSE
@@ -649,7 +729,7 @@ final class RelayService: ObservableObject {
             elapsedSeconds: elapsedSeconds,
             filesChanged: 0,
             linesAdded: 0,
-            transportMode: .lan
+            transportMode: transportMode
         )
 
         sessionManager.updateApplicationContext(with: state)

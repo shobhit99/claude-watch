@@ -35,6 +35,242 @@ function findBinary(name, candidates) {
   return null;
 }
 
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
+function parseOptionalBool(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return null;
+}
+
+function normalizeTunnelMode(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "quick") return "quick";
+  if (normalized === "token") return "token";
+  if (["off", "none", "disabled"].includes(normalized)) return "off";
+  return null;
+}
+
+function parseOptionalString(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function parseOptionalPositiveInt(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function expandHomePath(filePath) {
+  if (!filePath) return filePath;
+  if (filePath === "~") return os.homedir();
+  if (filePath.startsWith("~/")) {
+    return path.join(os.homedir(), filePath.slice(2));
+  }
+  return filePath;
+}
+
+function parseCliArgs(argv) {
+  const result = {
+    configPath: null,
+    tunnelEnabled: null,
+    tunnelMode: null,
+    cfToken: null,
+    ingressToken: null,
+    tunnelPublicUrl: null,
+    cloudflaredBin: null,
+    defaultCwd: null,
+  };
+
+  const readValue = (currentArg, index, flagName) => {
+    const inlinePrefix = `${flagName}=`;
+    if (currentArg.startsWith(inlinePrefix)) {
+      return { value: currentArg.slice(inlinePrefix.length), nextIndex: index };
+    }
+    const next = argv[index + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      return { value: next, nextIndex: index + 1 };
+    }
+    return { value: null, nextIndex: index };
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg.startsWith("--config")) {
+      const { value, nextIndex } = readValue(arg, i, "--config");
+      result.configPath = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--tunnel-enabled")) {
+      const { value, nextIndex } = readValue(arg, i, "--tunnel-enabled");
+      if (arg === "--tunnel-enabled" && value === null) {
+        result.tunnelEnabled = true;
+      } else {
+        result.tunnelEnabled = parseOptionalBool(value);
+      }
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--tunnel-mode")) {
+      const { value, nextIndex } = readValue(arg, i, "--tunnel-mode");
+      result.tunnelMode = normalizeTunnelMode(value);
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--cf-token")) {
+      const { value, nextIndex } = readValue(arg, i, "--cf-token");
+      result.cfToken = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--ingress-token")) {
+      const { value, nextIndex } = readValue(arg, i, "--ingress-token");
+      result.ingressToken = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--tunnel-public-url")) {
+      const { value, nextIndex } = readValue(arg, i, "--tunnel-public-url");
+      result.tunnelPublicUrl = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
+    if (arg.startsWith("--cloudflared-bin")) {
+      const { value, nextIndex } = readValue(arg, i, "--cloudflared-bin");
+      result.cloudflaredBin = parseOptionalString(value);
+      i = nextIndex;
+      continue;
+    }
+
+    if (!arg.startsWith("--") && !result.defaultCwd) {
+      result.defaultCwd = arg;
+    }
+  }
+
+  return result;
+}
+
+function loadBridgeConfig(configPath) {
+  const defaults = {
+    tunnel: {
+      enabled: null,
+      mode: null,
+      token: null,
+      ingressToken: null,
+      publicUrl: null,
+      cloudflaredBin: null,
+    },
+  };
+
+  if (!configPath) return defaults;
+  const resolvedPath = expandHomePath(configPath);
+  if (!resolvedPath || !fs.existsSync(resolvedPath)) return defaults;
+
+  try {
+    const raw = fs.readFileSync(resolvedPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return defaults;
+
+    const tunnel = parsed.tunnel && typeof parsed.tunnel === "object" ? parsed.tunnel : {};
+    return {
+      tunnel: {
+        enabled: firstDefined(parseOptionalBool(tunnel.enabled), defaults.tunnel.enabled),
+        mode: firstDefined(normalizeTunnelMode(tunnel.mode), defaults.tunnel.mode),
+        token: firstDefined(parseOptionalString(tunnel.token), defaults.tunnel.token),
+        ingressToken: firstDefined(parseOptionalString(tunnel.ingressToken), defaults.tunnel.ingressToken),
+        publicUrl: firstDefined(parseOptionalString(tunnel.publicUrl), defaults.tunnel.publicUrl),
+        cloudflaredBin: firstDefined(parseOptionalString(tunnel.cloudflaredBin), defaults.tunnel.cloudflaredBin),
+      },
+    };
+  } catch (error) {
+    log("warn", `Failed to parse bridge config: ${resolvedPath} (${error.message})`);
+    return defaults;
+  }
+}
+
+const CLI_OPTIONS = parseCliArgs(process.argv.slice(2));
+const CONFIG_PATH = firstDefined(
+  CLI_OPTIONS.configPath,
+  parseOptionalString(process.env.CLAUDE_WATCH_CONFIG),
+  path.join(process.cwd(), "bridge.config.json"),
+);
+const BRIDGE_CONFIG = loadBridgeConfig(CONFIG_PATH);
+
+const RAW_TUNNEL_ENABLED = firstDefined(
+  CLI_OPTIONS.tunnelEnabled,
+  parseOptionalBool(process.env.CLAUDE_WATCH_TUNNEL_ENABLED),
+  BRIDGE_CONFIG.tunnel.enabled,
+  null,
+);
+const RAW_TUNNEL_MODE = firstDefined(
+  CLI_OPTIONS.tunnelMode,
+  normalizeTunnelMode(process.env.CLAUDE_WATCH_TUNNEL_MODE),
+  BRIDGE_CONFIG.tunnel.mode,
+  null,
+);
+const TUNNEL_TOKEN = firstDefined(
+  CLI_OPTIONS.cfToken,
+  parseOptionalString(process.env.CLAUDE_WATCH_CF_TOKEN),
+  BRIDGE_CONFIG.tunnel.token,
+  null,
+);
+const CONFIGURED_INGRESS_BEARER_TOKEN = firstDefined(
+  CLI_OPTIONS.ingressToken,
+  parseOptionalString(process.env.CLAUDE_WATCH_INGRESS_TOKEN),
+  BRIDGE_CONFIG.tunnel.ingressToken,
+  null,
+);
+const TUNNEL_PUBLIC_URL = firstDefined(
+  CLI_OPTIONS.tunnelPublicUrl,
+  parseOptionalString(process.env.CLAUDE_WATCH_TUNNEL_PUBLIC_URL),
+  BRIDGE_CONFIG.tunnel.publicUrl,
+  null,
+);
+const TUNNEL_BIN_HINT = firstDefined(
+  CLI_OPTIONS.cloudflaredBin,
+  parseOptionalString(process.env.CLAUDE_WATCH_CLOUDFLARED_BIN),
+  BRIDGE_CONFIG.tunnel.cloudflaredBin,
+  null,
+);
+
+const TUNNEL_ENABLED = RAW_TUNNEL_ENABLED === true
+  || (RAW_TUNNEL_ENABLED === null && RAW_TUNNEL_MODE && RAW_TUNNEL_MODE !== "off")
+  || (RAW_TUNNEL_ENABLED === null && Boolean(TUNNEL_TOKEN));
+let TUNNEL_MODE = "off";
+if (TUNNEL_ENABLED) {
+  TUNNEL_MODE = RAW_TUNNEL_MODE || (TUNNEL_TOKEN ? "token" : "quick");
+  if (TUNNEL_MODE === "token" && !TUNNEL_TOKEN) {
+    log("warn", "Tunnel mode is token but no token provided, fallback to quick mode.");
+    TUNNEL_MODE = "quick";
+  }
+}
+
+let INGRESS_BEARER_TOKEN = parseOptionalString(CONFIGURED_INGRESS_BEARER_TOKEN);
+if (!INGRESS_BEARER_TOKEN && TUNNEL_ENABLED) {
+  INGRESS_BEARER_TOKEN = crypto.randomBytes(24).toString("hex");
+  log("warn", "Tunnel enabled but no ingress token configured. Generated a one-time Bearer token.");
+}
+
+const DEFAULT_SPAWN_CWD = firstDefined(
+  CLI_OPTIONS.defaultCwd,
+  parseOptionalString(process.env.CLAUDE_WATCH_CWD),
+  process.cwd(),
+);
+
 const CLAUDE_BIN = findBinary("claude", [
   `${os.homedir()}/.local/bin/claude`,
   "/usr/local/bin/claude",
@@ -47,6 +283,14 @@ const CODEX_BIN = findBinary("codex", [
   "/opt/homebrew/bin/codex",
 ]);
 
+const CLOUDFLARED_BIN = findBinary("cloudflared", [
+  expandHomePath(TUNNEL_BIN_HINT),
+  `${os.homedir()}/.local/bin/cloudflared`,
+  "/usr/local/bin/cloudflared",
+  "/opt/homebrew/bin/cloudflared",
+].filter(Boolean));
+const TUNNEL_RUNTIME_ENABLED = TUNNEL_ENABLED && Boolean(CLOUDFLARED_BIN);
+
 if (!CLAUDE_BIN) {
   log("warn", "Could not find 'claude' binary — Claude sessions will not be available.");
 }
@@ -54,6 +298,16 @@ if (CODEX_BIN) {
   log("info", `Codex binary found: ${CODEX_BIN}`);
 } else {
   log("info", "Codex not found — Codex sessions will not be available.");
+}
+if (TUNNEL_ENABLED) {
+  if (CLOUDFLARED_BIN) {
+    log("info", `cloudflared binary found: ${CLOUDFLARED_BIN}`);
+  } else {
+    log("warn", "Tunnel is enabled, but cloudflared was not found. Tunnel will stay disabled.");
+  }
+}
+if (INGRESS_BEARER_TOKEN) {
+  log("info", "Ingress Bearer auth is enabled for pairing/status endpoints.");
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +319,31 @@ const PORT_RANGE_END = 7869;
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
+const INGRESS_FAIL2BAN_MAX_ATTEMPTS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_MAX_ATTEMPTS),
+  5,
+);
+const INGRESS_FAIL2BAN_WINDOW_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_WINDOW_MS),
+  10 * 60 * 1000,
+);
+const INGRESS_FAIL2BAN_BAN_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_INGRESS_FAIL2BAN_BAN_MS),
+  30 * 60 * 1000,
+);
+const NON_PAIR_FAIL2BAN_MAX_ATTEMPTS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_MAX_ATTEMPTS),
+  15,
+);
+const NON_PAIR_FAIL2BAN_WINDOW_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_WINDOW_MS),
+  10 * 60 * 1000,
+);
+const NON_PAIR_FAIL2BAN_BAN_MS = firstDefined(
+  parseOptionalPositiveInt(process.env.CLAUDE_WATCH_NON_PAIR_FAIL2BAN_BAN_MS),
+  30 * 60 * 1000,
+);
+const INGRESS_FAIL2BAN_UNKNOWN_KEY = "__unknown__";
 const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 const SSE_BUFFER_SIZE = 500;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
@@ -86,6 +365,10 @@ let pairingCodeExpiresAt = 0;
 // Rate limiting
 let rateLimitAttempts = 0;
 let rateLimitWindowStart = Date.now();
+/** @type {Map<string, {count: number, windowStart: number, bannedUntil: number}>} */
+const ingressAuthFail2ban = new Map();
+/** @type {Map<string, {count: number, windowStart: number, bannedUntil: number}>} */
+const nonPairFail2ban = new Map();
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
@@ -124,6 +407,20 @@ let codexMonitorInterval = null;
 let bonjourInstance = null;
 let bonjourService = null;
 
+let currentBoundPort = null;
+let currentLanIP = "127.0.0.1";
+let tunnelProcess = null;
+let tunnelShutdownRequested = false;
+const tunnelState = {
+  enabled: TUNNEL_RUNTIME_ENABLED,
+  mode: TUNNEL_MODE,
+  status: TUNNEL_RUNTIME_ENABLED ? "idle" : "disabled",
+  provider: "cloudflare",
+  localUrl: null,
+  publicUrl: TUNNEL_PUBLIC_URL,
+  error: null,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -160,11 +457,181 @@ function recordRateLimitAttempt() {
   rateLimitAttempts++;
 }
 
-function requireAuth(req) {
+function extractBearerToken(req) {
   const auth = req.headers["authorization"];
-  if (!auth || !auth.startsWith("Bearer ")) return false;
-  const token = auth.slice(7);
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return auth.slice(7);
+}
+
+function normalizeClientIp(rawIp) {
+  const value = parseOptionalString(rawIp);
+  if (!value) return null;
+  const first = value.split(",")[0]?.trim();
+  if (!first) return null;
+  if (first.startsWith("::ffff:")) return first.slice(7);
+  return first;
+}
+
+function getClientIp(req) {
+  return normalizeClientIp(
+    req.headers["cf-connecting-ip"]
+    || req.headers["x-forwarded-for"]
+    || req.headers["x-real-ip"]
+    || req.socket?.remoteAddress
+    || null,
+  );
+}
+
+function getIngressFail2banKey(req) {
+  return getClientIp(req) || INGRESS_FAIL2BAN_UNKNOWN_KEY;
+}
+
+function requireAuth(req) {
+  const token = extractBearerToken(req);
   return token === sessionToken && sessionToken !== null;
+}
+
+function requireIngressAuth(req) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  return extractBearerToken(req) === INGRESS_BEARER_TOKEN;
+}
+
+function requireIngressOrSessionAuth(req) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  const token = extractBearerToken(req);
+  if (!token) return false;
+  return token === INGRESS_BEARER_TOKEN || (sessionToken !== null && token === sessionToken);
+}
+
+function sendNginxNotFound(res) {
+  const body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+  res.writeHead(404, {
+    "Content-Type": "text/html",
+    "Content-Length": Buffer.byteLength(body),
+    "Server": "nginx",
+  });
+  res.end(body);
+}
+
+function isIngressIpBanned(clientKey) {
+  if (!INGRESS_BEARER_TOKEN || !clientKey) return false;
+  const entry = ingressAuthFail2ban.get(clientKey);
+  if (!entry) return false;
+  if (entry.bannedUntil <= 0) return false;
+  if (entry.bannedUntil > Date.now()) {
+    return true;
+  }
+  ingressAuthFail2ban.delete(clientKey);
+  return false;
+}
+
+function clearIngressFail2ban(clientKey) {
+  if (!clientKey) return;
+  ingressAuthFail2ban.delete(clientKey);
+}
+
+function recordIngressAuthFailure(clientKey, clientIp = null) {
+  if (!INGRESS_BEARER_TOKEN || !clientKey) return;
+  const now = Date.now();
+  const entry = ingressAuthFail2ban.get(clientKey) || {
+    count: 0,
+    windowStart: now,
+    bannedUntil: 0,
+  };
+
+  if (entry.bannedUntil > now) {
+    ingressAuthFail2ban.set(clientKey, entry);
+    return;
+  }
+
+  if (now - entry.windowStart > INGRESS_FAIL2BAN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  entry.count += 1;
+  if (entry.count >= INGRESS_FAIL2BAN_MAX_ATTEMPTS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.bannedUntil = now + INGRESS_FAIL2BAN_BAN_MS;
+    const identity = clientIp || clientKey;
+    log("warn", `Ingress fail2ban blocked client ${identity} for ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s due to invalid Bearer token`);
+  }
+
+  ingressAuthFail2ban.set(clientKey, entry);
+}
+
+function enforceIngressProtection(req, res, options = {}) {
+  if (!INGRESS_BEARER_TOKEN) return true;
+  const allowSession = options.allowSession === true;
+  const clientIp = getClientIp(req);
+  const clientKey = getIngressFail2banKey(req);
+
+  if (isIngressIpBanned(clientKey)) {
+    sendNginxNotFound(res);
+    return false;
+  }
+
+  const authorized = allowSession ? requireIngressOrSessionAuth(req) : requireIngressAuth(req);
+  if (!authorized) {
+    recordIngressAuthFailure(clientKey, clientIp);
+    sendNginxNotFound(res);
+    return false;
+  }
+
+  const ingressToken = extractBearerToken(req);
+  if (ingressToken === INGRESS_BEARER_TOKEN) {
+    clearIngressFail2ban(clientKey);
+  }
+  return true;
+}
+
+function isNonPairBanned(clientKey) {
+  if (!clientKey) return false;
+  const entry = nonPairFail2ban.get(clientKey);
+  if (!entry) return false;
+  if (entry.bannedUntil <= 0) return false;
+  if (entry.bannedUntil > Date.now()) {
+    return true;
+  }
+  nonPairFail2ban.delete(clientKey);
+  return false;
+}
+
+function clearNonPairFailures(clientKey) {
+  if (!clientKey) return;
+  nonPairFail2ban.delete(clientKey);
+}
+
+function recordNonPairFailure(clientKey, clientIp = null, reason = "") {
+  if (!clientKey) return;
+  const now = Date.now();
+  const entry = nonPairFail2ban.get(clientKey) || {
+    count: 0,
+    windowStart: now,
+    bannedUntil: 0,
+  };
+
+  if (entry.bannedUntil > now) {
+    nonPairFail2ban.set(clientKey, entry);
+    return;
+  }
+
+  if (now - entry.windowStart > NON_PAIR_FAIL2BAN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  entry.count += 1;
+  if (entry.count >= NON_PAIR_FAIL2BAN_MAX_ATTEMPTS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.bannedUntil = now + NON_PAIR_FAIL2BAN_BAN_MS;
+    const identity = clientIp || clientKey;
+    log("warn", `Non-pair fail2ban blocked client ${identity} for ${Math.ceil(NON_PAIR_FAIL2BAN_BAN_MS / 1000)}s (${reason || "repeated endpoint probing"})`);
+  }
+
+  nonPairFail2ban.set(clientKey, entry);
 }
 
 function jsonResponse(res, status, body) {
@@ -197,6 +664,149 @@ function availableAgentsList() {
   if (CLAUDE_BIN) agents.push("claude");
   if (CODEX_BIN) agents.push("codex");
   return agents;
+}
+
+function getTunnelStatus() {
+  return {
+    enabled: tunnelState.enabled,
+    provider: tunnelState.provider,
+    mode: tunnelState.mode,
+    status: tunnelState.status,
+    ingressAuthRequired: Boolean(INGRESS_BEARER_TOKEN),
+    localUrl: tunnelState.localUrl,
+    publicUrl: tunnelState.publicUrl,
+    error: tunnelState.error,
+  };
+}
+
+function normalizePublicUrl(raw) {
+  if (!raw) return null;
+  const clean = String(raw).trim().replace(/[)\].,;]+$/, "");
+  try {
+    const parsed = new URL(clean);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function extractCloudflareUrl(line) {
+  if (!line) return null;
+  const quickMatch = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi);
+  if (quickMatch && quickMatch.length > 0) {
+    return normalizePublicUrl(quickMatch[0]);
+  }
+
+  if (tunnelState.mode === "token") {
+    const genericMatch = line.match(/https?:\/\/[^\s"'<>]+/i);
+    if (genericMatch && genericMatch.length > 0) {
+      return normalizePublicUrl(genericMatch[0]);
+    }
+  }
+  return null;
+}
+
+function startCloudflareTunnel(localUrl) {
+  if (!TUNNEL_RUNTIME_ENABLED) return;
+  if (tunnelProcess) return;
+
+  tunnelState.localUrl = localUrl;
+  tunnelState.error = null;
+  tunnelState.status = "starting";
+  tunnelState.mode = TUNNEL_MODE;
+
+  const args = [];
+  if (TUNNEL_MODE === "token") {
+    args.push("tunnel", "run", "--token", TUNNEL_TOKEN);
+  } else {
+    args.push("tunnel", "--url", localUrl);
+  }
+  args.push("--no-autoupdate");
+
+  log("info", `Starting Cloudflare tunnel (${TUNNEL_MODE})...`);
+  tunnelShutdownRequested = false;
+  tunnelProcess = childSpawn(CLOUDFLARED_BIN, args, {
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const handleLine = (rawLine, stream) => {
+    const line = String(rawLine).trim();
+    if (!line) return;
+
+    if (stream === "stderr") {
+      log("warn", `[cloudflared] ${line}`);
+    } else {
+      log("info", `[cloudflared] ${line}`);
+    }
+
+    const publicUrl = extractCloudflareUrl(line);
+    if (publicUrl && tunnelState.publicUrl !== publicUrl) {
+      tunnelState.publicUrl = publicUrl;
+      tunnelState.status = "connected";
+      tunnelState.error = null;
+      log("info", `Cloudflare public endpoint ready: ${publicUrl}`);
+    }
+
+    if (TUNNEL_MODE === "token"
+      && /(registered tunnel connection|connection registered|connected to cloudflare)/i.test(line)) {
+      if (tunnelState.status !== "connected") {
+        tunnelState.status = "connected";
+      }
+    }
+  };
+
+  tunnelProcess.stdout.on("data", (chunk) => {
+    for (const line of chunk.toString("utf-8").split(/\r?\n/)) {
+      handleLine(line, "stdout");
+    }
+  });
+
+  tunnelProcess.stderr.on("data", (chunk) => {
+    for (const line of chunk.toString("utf-8").split(/\r?\n/)) {
+      handleLine(line, "stderr");
+    }
+  });
+
+  tunnelProcess.on("error", (error) => {
+    tunnelState.status = "error";
+    tunnelState.error = error.message;
+    log("error", `cloudflared failed to start: ${error.message}`);
+  });
+
+  tunnelProcess.on("exit", (code, signal) => {
+    tunnelProcess = null;
+    if (tunnelShutdownRequested) {
+      tunnelState.status = "stopped";
+      tunnelState.error = null;
+      log("info", "Cloudflare tunnel stopped.");
+      return;
+    }
+
+    tunnelState.status = "error";
+    tunnelState.error = `cloudflared exited (code=${code ?? "null"}, signal=${signal ?? "null"})`;
+    log("warn", tunnelState.error);
+  });
+}
+
+function stopCloudflareTunnel() {
+  if (!tunnelProcess) return;
+  tunnelShutdownRequested = true;
+  try {
+    tunnelProcess.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+
+  setTimeout(() => {
+    if (!tunnelProcess) return;
+    try {
+      tunnelProcess.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+  }, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1548,9 @@ async function handlePair(req, res) {
   if (req.method !== "POST") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
+  if (!enforceIngressProtection(req, res)) {
+    return;
+  }
 
   if (isRateLimited()) {
     return jsonResponse(res, 429, { error: "Too many pairing attempts. Try again later." });
@@ -988,8 +1601,10 @@ async function handleCommand(req, res) {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
   if (!requireAuth(req)) {
+    recordNonPairFailure(getIngressFail2banKey(req), getClientIp(req), "unauthorized /command");
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+  clearNonPairFailures(getIngressFail2banKey(req));
 
   let body;
   try {
@@ -1017,7 +1632,7 @@ async function handleCommand(req, res) {
     if (!validAgents.includes(spawnRequest)) {
       return jsonResponse(res, 400, { error: `Invalid agent: ${spawnRequest}. Use: ${validAgents.join(", ")}` });
     }
-    const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const cwd = body.cwd || DEFAULT_SPAWN_CWD || process.env.HOME || process.cwd();
     const newId = spawnSession(spawnRequest, cwd);
     if (!newId) {
       return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });
@@ -1126,7 +1741,7 @@ async function handleCommand(req, res) {
     if (!targetSession) {
       // Auto-spawn a new session
       const requestedAgent = agent || "claude";
-      const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+      const cwd = body.cwd || DEFAULT_SPAWN_CWD || process.env.HOME || process.cwd();
       const newId = spawnSession(requestedAgent, cwd);
       if (!newId) {
         return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });
@@ -1158,8 +1773,10 @@ function handleEvents(req, res) {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
   if (!requireAuth(req)) {
+    recordNonPairFailure(getIngressFail2banKey(req), getClientIp(req), "unauthorized /events");
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+  clearNonPairFailures(getIngressFail2banKey(req));
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -1248,7 +1865,7 @@ function resolveHookSession(body) {
 
   // No session exists — auto-create one for this external Claude/Codex instance
   const agent = source === "codex" ? "codex" : "claude";
-  const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+  const resolvedCwd = cwd || DEFAULT_SPAWN_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
   const sessionId = crypto.randomUUID();
 
@@ -1387,6 +2004,9 @@ async function handleHookError(req, res) {
 }
 
 function handleStatus(_req, res) {
+  if (!enforceIngressProtection(_req, res, { allowSession: true })) {
+    return;
+  }
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,
@@ -1397,6 +2017,10 @@ function handleStatus(_req, res) {
     sseClients: sseClients.size,
     pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
+    ingressAuthRequired: Boolean(INGRESS_BEARER_TOKEN),
+    localEndpoint: currentBoundPort ? `http://${currentLanIP}:${currentBoundPort}` : null,
+    publicEndpoint: tunnelState.publicUrl,
+    tunnel: getTunnelStatus(),
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
     activeAgent: mostRecentRunningSession?.agent || null,
@@ -1422,6 +2046,12 @@ const routes = {
 async function onRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const routeKey = `${req.method} ${url.pathname}`;
+  const clientKey = getIngressFail2banKey(req);
+  const clientIp = getClientIp(req);
+
+  if (url.pathname !== "/pair" && isNonPairBanned(clientKey)) {
+    return sendNginxNotFound(res);
+  }
 
   const handler = routes[routeKey];
   if (handler) {
@@ -1434,6 +2064,10 @@ async function onRequest(req, res) {
       }
     }
   } else {
+    if (url.pathname !== "/pair") {
+      recordNonPairFailure(clientKey, clientIp, `unknown route ${routeKey}`);
+      return sendNginxNotFound(res);
+    }
     jsonResponse(res, 404, { error: "Not found" });
   }
 }
@@ -1474,6 +2108,7 @@ async function startServer() {
     process.exit(1);
   }
 
+  currentBoundPort = boundPort;
   log("info", `Bridge server listening on 0.0.0.0:${boundPort}`);
 
   const code = generatePairingCode();
@@ -1513,6 +2148,15 @@ async function startServer() {
     }
     if (lanIP !== "127.0.0.1") break;
   }
+  currentLanIP = lanIP;
+
+  const localBridgeUrl = `http://127.0.0.1:${boundPort}`;
+  if (TUNNEL_RUNTIME_ENABLED) {
+    startCloudflareTunnel(localBridgeUrl);
+  } else if (TUNNEL_ENABLED && !CLOUDFLARED_BIN) {
+    tunnelState.status = "disabled";
+    tunnelState.error = "cloudflared binary not found";
+  }
 
   const agentLine = agents.length ? agents.join(" + ") : "none";
   console.log("");
@@ -1524,6 +2168,15 @@ async function startServer() {
   console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
   console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
   console.log("╚═══════════════════════════════════════╝");
+  if (TUNNEL_ENABLED) {
+    console.log(`Tunnel Mode: ${TUNNEL_MODE}`);
+    console.log(`Tunnel URL:  ${tunnelState.publicUrl || "starting..."}`);
+  }
+  if (INGRESS_BEARER_TOKEN) {
+    console.log(`Ingress Bearer Token: ${INGRESS_BEARER_TOKEN}`);
+    console.log(`Ingress Fail2Ban: ${INGRESS_FAIL2BAN_MAX_ATTEMPTS} failures/${Math.ceil(INGRESS_FAIL2BAN_WINDOW_MS / 1000)}s, ban ${Math.ceil(INGRESS_FAIL2BAN_BAN_MS / 1000)}s`);
+  }
+  console.log(`Endpoint Fail2Ban (except /pair): ${NON_PAIR_FAIL2BAN_MAX_ATTEMPTS} failures/${Math.ceil(NON_PAIR_FAIL2BAN_WINDOW_MS / 1000)}s, ban ${Math.ceil(NON_PAIR_FAIL2BAN_BAN_MS / 1000)}s`);
   console.log("");
 
   // --- Graceful shutdown ---
@@ -1549,6 +2202,7 @@ async function startServer() {
     }
     sessions.clear();
     stopCodexMonitor();
+    stopCloudflareTunnel();
 
     if (bonjourService) {
       try { bonjourInstance.unpublishAll(); } catch { /* ignore */ }
